@@ -1,0 +1,19 @@
+{
+  "<pad>": null,
+  "<eos>": null,
+  "<bos>": null,
+  "<unk>": null,
+  "<mask>": null,
+  "<|tool>": "<tool>",
+  "<tool|>": "</tool>",
+  "<|tool_call>": "<call>",
+  "<tool_call|>": "</call>",
+  "<|tool_response>": "<result>",
+  "<tool_response|>": "</result>",
+  "<|\"|>": "<escape>",
+  "<|think|>": "<think>",
+  "<|channel>": "<section>",
+  "<channel|>": "</section>",
+  "<|turn>": "<turn>",
+  "<turn|>": "</turn>"
+}
