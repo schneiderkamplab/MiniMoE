@@ -31,6 +31,7 @@ class ReindexTokenIdsSpec(UnarySpec):
     mapping_path: Path
     dim: int | None
     keep_unmapped: bool
+    output_size: int | None
 
 
 class ReindexTokenIdsTransform(UnaryTransform[ReindexTokenIdsSpec]):
@@ -39,7 +40,7 @@ class ReindexTokenIdsTransform(UnaryTransform[ReindexTokenIdsSpec]):
     name = "reindex_token_ids"
     error_type = ReindexTokenIdsTransformError
     spec_type = ReindexTokenIdsSpec
-    allowed_keys = {"target", "mapping", "dim", "keep_unmapped"}
+    allowed_keys = {"target", "mapping", "dim", "keep_unmapped", "output_size"}
     required_keys = {"target", "mapping"}
     help_text = (
         "Reindexes a token-dependent tensor using tokenizer_mapping.json.\n"
@@ -47,7 +48,9 @@ class ReindexTokenIdsTransform(UnaryTransform[ReindexTokenIdsSpec]):
         "The mapping file must map original token ids to new token ids. The transform\n"
         "builds the inverse order for mapped ids. By default, unmapped tensor rows or\n"
         "columns are left at the tail in their original order, but you can drop them by\n"
-        "setting keep_unmapped: false.\n"
+        "setting keep_unmapped: false. When output_size is provided, the transform writes\n"
+        "mapped ids into a zero-initialized output axis of that size, which supports added\n"
+        "tokens that have no source checkpoint row.\n"
         "\n"
         "Examples:\n"
         "  reindex_token_ids: { target: model::model.embed_tokens.weight, mapping: /tmp/tokenizer_mapping.json }\n"
@@ -71,11 +74,21 @@ class ReindexTokenIdsTransform(UnaryTransform[ReindexTokenIdsSpec]):
             raise ReindexTokenIdsTransformError(
                 "reindex_token_ids.keep_unmapped must be a boolean"
             )
+        raw_output_size = payload.get("output_size")
+        if raw_output_size is None:
+            output_size: int | None = None
+        elif isinstance(raw_output_size, int) and raw_output_size >= 0:
+            output_size = raw_output_size
+        else:
+            raise ReindexTokenIdsTransformError(
+                "reindex_token_ids.output_size must be a non-negative integer"
+            )
         return ReindexTokenIdsSpec(
             target_ref=target_ref,
             mapping_path=mapping_path,
             dim=dim,
             keep_unmapped=raw_keep_unmapped,
+            output_size=output_size,
         )
 
     def apply_to_target(
@@ -89,13 +102,25 @@ class ReindexTokenIdsTransform(UnaryTransform[ReindexTokenIdsSpec]):
         tensor = state_dict[name]
         mapping = _load_tokenizer_mapping(spec.mapping_path)
         dim = _resolve_reindex_dim(spec.dim, tensor, mapping, name)
-        index = _build_reindex_tensor(
+        if spec.output_size is None:
+            index = _build_reindex_tensor(
+                mapping,
+                size=int(tensor.shape[dim]),
+                device=tensor.device,
+                keep_unmapped=spec.keep_unmapped,
+            )
+            state_dict[name] = tensor.index_select(dim, index).clone()
+            return
+        if spec.keep_unmapped:
+            raise ReindexTokenIdsTransformError(
+                "reindex_token_ids.output_size requires keep_unmapped: false"
+            )
+        state_dict[name] = _remap_tensor_with_output_size(
+            tensor,
             mapping,
-            size=int(tensor.shape[dim]),
-            device=tensor.device,
-            keep_unmapped=spec.keep_unmapped,
+            dim=dim,
+            output_size=spec.output_size,
         )
-        state_dict[name] = tensor.index_select(dim, index).clone()
 
 
 def _resolve_reindex_dim(
@@ -112,7 +137,7 @@ def _resolve_reindex_dim(
             )
         return dim
 
-    max_index = max(mapping.values(), default=-1)
+    max_index = max(mapping.keys(), default=-1)
     candidate_dims = [
         dim
         for dim in {0, tensor.dim() - 1}
@@ -172,6 +197,39 @@ def _build_reindex_tensor(
             f"{len(full_index)} does not match expected length {expected_length}"
         )
     return torch.tensor(full_index, dtype=torch.long, device=device)
+
+
+def _remap_tensor_with_output_size(
+    tensor: torch.Tensor,
+    mapping: dict[int, int],
+    *,
+    dim: int,
+    output_size: int,
+) -> torch.Tensor:
+    old_ids = sorted(mapping)
+    if not old_ids:
+        shape = list(tensor.shape)
+        shape[dim] = output_size
+        return tensor.new_zeros(shape)
+
+    max_old_id = max(old_ids)
+    max_new_id = max(mapping.values())
+    axis_size = int(tensor.shape[dim])
+    if max_old_id >= axis_size:
+        raise ReindexTokenIdsTransformError(
+            f"Mapping references original id {max_old_id}, but tensor axis has size {axis_size}"
+        )
+    if max_new_id >= output_size:
+        raise ReindexTokenIdsTransformError(
+            f"Mapping references new id {max_new_id}, but output axis has size {output_size}"
+        )
+
+    old_index = torch.tensor(old_ids, dtype=torch.long, device=tensor.device)
+    new_index = torch.tensor([mapping[old_id] for old_id in old_ids], dtype=torch.long, device=tensor.device)
+    remapped = tensor.new_zeros([*tensor.shape[:dim], output_size, *tensor.shape[dim + 1 :]])
+    source = tensor.index_select(dim, old_index)
+    remapped.index_copy_(dim, new_index, source)
+    return remapped
 
 
 @lru_cache(maxsize=None)

@@ -76,11 +76,11 @@ def test_save_reordered_tokenizer_with_reassign_writes_mapping_and_backups(
     tokenizer_data = json.loads((destination / "tokenizer.json").read_text(encoding="utf-8"))
     assert tokenizer_data["model"]["vocab"] == {
         "<pad>": 0,
-        "x": 1,
-        "y": 2,
-        "a": 3,
-        "b": 4,
-        "c": 5,
+        "a": 1,
+        "b": 2,
+        "c": 3,
+        "x": 4,
+        "y": 5,
         "z": 6,
         "ab": 7,
         "xy": 8,
@@ -91,11 +91,11 @@ def test_save_reordered_tokenizer_with_reassign_writes_mapping_and_backups(
     mapping_data = json.loads((destination / "tokenizer_mapping.json").read_text(encoding="utf-8"))
     assert mapping_data == {
         "0": 0,
-        "1": 1,
-        "2": 2,
-        "3": 3,
-        "4": 4,
-        "5": 5,
+        "1": 4,
+        "2": 5,
+        "3": 1,
+        "4": 2,
+        "5": 3,
         "6": 6,
         "7": 8,
         "8": 7,
@@ -543,3 +543,97 @@ def test_rewrite_chat_template_files_preserves_literal_brace_boundaries(tmp_path
     chat_template = (destination / "chat_template.jinja").read_text(encoding="utf-8")
     rendered = Environment().from_string(chat_template).render(value="k", flag=True)
     assert rendered == "k:x{k"
+
+
+def test_save_reordered_tokenizer_with_token_map_deletes_cascade_and_adds_tokens(
+    sample_tokenizer_contents: TokenizerContents,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "saved-tokenizer-token-map"
+
+    save_reordered_tokenizer(
+        sample_tokenizer_contents,
+        destination,
+        order_name="good",
+        reassign=True,
+        token_delete_literals=("ab",),
+        token_add_literals=("ayz",),
+    )
+
+    tokenizer_data = json.loads((destination / "tokenizer.json").read_text(encoding="utf-8"))
+    assert tokenizer_data["model"]["vocab"] == {
+        "<pad>": 0,
+        "a": 1,
+        "b": 2,
+        "c": 3,
+        "x": 4,
+        "y": 5,
+        "z": 6,
+        "yz": 7,
+        "ayz": 8,
+        "xy": 9,
+        "xyz": 10,
+    }
+    assert "added_tokens" not in tokenizer_data
+
+    merges_txt_lines = (destination / "merges.txt").read_text(encoding="utf-8").splitlines()
+    assert merges_txt_lines == [
+        "#version: 0.2",
+        "y z",
+        "a yz",
+        "x y",
+        "xy z",
+    ]
+
+    mapping_data = json.loads((destination / "tokenizer_mapping.json").read_text(encoding="utf-8"))
+    assert mapping_data == {
+        "0": 0,
+        "1": 4,
+        "2": 5,
+        "3": 1,
+        "4": 2,
+        "5": 3,
+        "6": 6,
+        "7": 9,
+        "10": 10,
+    }
+
+    tokenizer_config = json.loads((destination / "tokenizer_config.json").read_text(encoding="utf-8"))
+    assert "added_tokens_encoder" not in tokenizer_config
+    assert "added_tokens_decoder" not in tokenizer_config
+
+
+def test_save_reordered_tokenizer_with_token_map_renames_tokens_and_merges(
+    sample_tokenizer_contents: TokenizerContents,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "saved-tokenizer-token-rename"
+
+    save_reordered_tokenizer(
+        sample_tokenizer_contents,
+        destination,
+        order_name="good",
+        reassign=True,
+        token_rename_literals={"ab": "AB"},
+    )
+
+    tokenizer_data = json.loads((destination / "tokenizer.json").read_text(encoding="utf-8"))
+    assert "ab" not in tokenizer_data["model"]["vocab"]
+    assert tokenizer_data["model"]["vocab"]["AB"] == 7
+    assert tokenizer_data["model"]["vocab"]["a"] == 1
+    assert tokenizer_data["model"]["vocab"]["x"] == 4
+    assert tokenizer_data["model"]["merges"] == [
+        ["a", "b"],
+        ["x", "y"],
+        ["AB", "c"],
+        ["xy", "z"],
+    ]
+
+    merges_txt_lines = (destination / "merges.txt").read_text(encoding="utf-8").splitlines()
+    assert merges_txt_lines == [
+        "#version: 0.2",
+        "a b",
+        "x y",
+        "AB c",
+        "xy z",
+    ]

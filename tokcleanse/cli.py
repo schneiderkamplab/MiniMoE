@@ -27,7 +27,7 @@ from .model_surgery import (
     GEMMA4_DEFAULT_EMBEDDING_WEIGHT_NAMES,
     GEMMA4_DEFAULT_LM_HEAD_WEIGHT_NAMES,
 )
-from .saver import save_reordered_tokenizer
+from .saver import _SanitizeSummary, _save_reordered_tokenizer_with_summary
 
 app = typer.Typer(
     add_completion=False,
@@ -68,6 +68,11 @@ def sanitize_command(
         "--overwrite",
         help="Replace the destination directory if it already exists.",
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        help="Print the concrete token, merge, and special-token sets in addition to summary counts.",
+    ),
     reassign: bool = typer.Option(
         False,
         "--reassign",
@@ -75,10 +80,18 @@ def sanitize_command(
     ),
     special_token_map_file: Path | None = typer.Option(
         None,
-        "--special-token-map-file",
+        "--special-token-map",
         help=(
-            "JSON file mapping old special-token literals to null (keep the literal) or a new "
-            "literal string. Special tokens omitted from the file are removed before reassignment."
+            'JSON file with {"keep": [...], "rename": {...}} for special tokens. Omitted '
+            "current special tokens are removed before reassignment."
+        ),
+    ),
+    token_map_file: Path | None = typer.Option(
+        None,
+        "--token-map",
+        help=(
+            'JSON file with {"delete": [...], "add": [...], "rename": {...}} for non-special '
+            "tokens. Deletes cascade through merge-derived tokens."
         ),
     ),
     embedding_weight_names: list[str] = typer.Option(
@@ -95,12 +108,19 @@ def sanitize_command(
     """Save a fully copied tokenizer directory with reordered merges."""
 
     if special_token_map_file is not None and not reassign:
-        raise typer.BadParameter("--special-token-map-file requires --reassign")
+        raise typer.BadParameter("--special-token-map requires --reassign")
+    if token_map_file is not None and not reassign:
+        raise typer.BadParameter("--token-map requires --reassign")
     contents = load_tokenizer_contents(source, models_dir=models_dir)
     special_token_literal_map = None
+    token_delete_literals: tuple[str, ...] = ()
+    token_add_literals: tuple[str, ...] = ()
+    token_rename_literals: dict[str, str] = {}
     if special_token_map_file is not None:
         special_token_literal_map = _load_special_token_literal_map_file(special_token_map_file)
-    saved_path = save_reordered_tokenizer(
+    if token_map_file is not None:
+        token_delete_literals, token_add_literals, token_rename_literals = _load_token_map_file(token_map_file)
+    saved_path, summary = _save_reordered_tokenizer_with_summary(
         contents,
         destination,
         order_name=order_name,
@@ -108,10 +128,45 @@ def sanitize_command(
         overwrite=overwrite,
         reassign=reassign,
         special_token_literal_map=special_token_literal_map,
+        token_delete_literals=token_delete_literals,
+        token_add_literals=token_add_literals,
+        token_rename_literals=token_rename_literals,
         embedding_weight_names=tuple(embedding_weight_names),
         lm_head_weight_names=tuple(lm_head_weight_names),
     )
     typer.echo(str(saved_path))
+    typer.echo(
+        (
+            "Special tokens: "
+            f"kept={summary.special_tokens_kept}, "
+            f"renamed={summary.special_tokens_renamed}, "
+            f"dropped={summary.special_tokens_dropped}"
+        ),
+        err=True,
+    )
+    typer.echo(
+        (
+            "Tokens: "
+            f"delete_requested={summary.requested_tokens_deleted}, "
+            f"rename_requested={summary.requested_tokens_renamed}, "
+            f"deleted_total={summary.tokens_deleted_total}, "
+            f"add_requested={summary.requested_tokens_added}, "
+            f"existing_ignored={summary.existing_tokens_ignored}, "
+            f"requested_added={summary.requested_tokens_added_total}, "
+            f"intermediate_added={summary.intermediate_tokens_added}"
+        ),
+        err=True,
+    )
+    typer.echo(
+        (
+            "Merges: "
+            f"added={summary.synthetic_merges_added}, "
+            f"deleted={summary.original_merges_deleted}"
+        ),
+        err=True,
+    )
+    if verbose:
+        _echo_verbose_sanitize_summary(summary)
 
 
 @app.command("download")
@@ -260,14 +315,75 @@ def _load_special_token_literal_map_file(path: Path) -> dict[str, str | None]:
     if not isinstance(data, dict):
         raise typer.BadParameter(f"{path} must contain a JSON object")
 
-    mapping: dict[str, str | None] = {}
-    for key, value in data.items():
-        if not isinstance(key, str):
-            raise typer.BadParameter(f"{path} must map string literals to null or strings")
-        if value is not None and not isinstance(value, str):
-            raise typer.BadParameter(f"{path} must map string literals to null or strings")
+    keep = data.get("keep", [])
+    rename = data.get("rename", {})
+    if not isinstance(keep, list) or not all(isinstance(item, str) for item in keep):
+        raise typer.BadParameter(f"{path} keep must be a list of strings")
+    if not isinstance(rename, dict):
+        raise typer.BadParameter(f"{path} rename must be a JSON object")
+
+    mapping: dict[str, str | None] = {literal: None for literal in keep}
+    for key, value in rename.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise typer.BadParameter(f"{path} rename must map strings to strings")
+        if key in mapping:
+            raise typer.BadParameter(f"{path} cannot list the same token in both keep and rename: {key}")
         mapping[key] = value
     return mapping
+
+
+def _load_token_map_file(path: Path) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, str]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"Invalid JSON in {path}") from exc
+    if not isinstance(data, dict):
+        raise typer.BadParameter(f"{path} must contain a JSON object")
+
+    delete = data.get("delete", [])
+    add = data.get("add", [])
+    rename = data.get("rename", {})
+    if not isinstance(delete, list) or not all(isinstance(item, str) for item in delete):
+        raise typer.BadParameter(f"{path} delete must be a list of strings")
+    if not isinstance(add, list) or not all(isinstance(item, str) for item in add):
+        raise typer.BadParameter(f"{path} add must be a list of strings")
+    if not isinstance(rename, dict):
+        raise typer.BadParameter(f"{path} rename must be a JSON object")
+
+    if len(set(delete)) != len(delete):
+        raise typer.BadParameter(f"{path} delete cannot contain duplicate tokens")
+    if len(set(add)) != len(add):
+        raise typer.BadParameter(f"{path} add cannot contain duplicate tokens")
+    rename_pairs: dict[str, str] = {}
+    for key, value in rename.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise typer.BadParameter(f"{path} rename must map strings to strings")
+        rename_pairs[key] = value
+    overlap = sorted(set(delete) & set(add))
+    if overlap:
+        raise typer.BadParameter(
+            f"{path} cannot list the same token in both delete and add: {', '.join(overlap)}"
+        )
+    return tuple(delete), tuple(add), rename_pairs
+
+
+def _echo_verbose_sanitize_summary(summary: _SanitizeSummary) -> None:
+    _echo_json_detail("Requested token deletes", summary.requested_token_deletes)
+    _echo_json_detail("Requested token renames", dict(summary.requested_token_renames))
+    _echo_json_detail("Deleted tokens", summary.deleted_tokens)
+    _echo_json_detail("Requested token adds", summary.requested_token_adds)
+    _echo_json_detail("Existing add tokens ignored", summary.existing_ignored_tokens)
+    _echo_json_detail("Requested added tokens", summary.requested_added_tokens)
+    _echo_json_detail("Intermediate added tokens", summary.intermediate_added_tokens)
+    _echo_json_detail("Added merges", summary.synthetic_merge_pairs)
+    _echo_json_detail("Deleted merges", summary.deleted_merge_pairs)
+    _echo_json_detail("Kept special tokens", summary.special_tokens_kept_literals)
+    _echo_json_detail("Renamed special tokens", dict(summary.special_tokens_renamed_pairs))
+    _echo_json_detail("Dropped special tokens", summary.special_tokens_dropped_literals)
+
+
+def _echo_json_detail(label: str, value: object) -> None:
+    typer.echo(f"{label}: {json.dumps(value, ensure_ascii=False)}", err=True)
 
 
 __all__ = ["app", "compare_command", "download_command", "main", "sanitize_command"]
