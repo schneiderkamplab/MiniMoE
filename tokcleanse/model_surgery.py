@@ -36,6 +36,7 @@ def rewrite_reassigned_model(
     mapping_path = destination_dir / "tokenizer_mapping.json"
     if not mapping_path.exists():
         raise ValueError(f"Missing tokenizer mapping file: {mapping_path}")
+    final_vocab_size = _load_final_vocab_size(destination_dir, mapping_path)
 
     output_checkpoint_path = _destination_checkpoint_path(destination_dir, checkpoint_input_path)
     plan_path = destination_dir / _MODEL_PLAN_FILENAME
@@ -44,6 +45,7 @@ def rewrite_reassigned_model(
             checkpoint_input_path=checkpoint_input_path,
             output_checkpoint_path=output_checkpoint_path,
             mapping_path=mapping_path,
+            final_vocab_size=final_vocab_size,
             embedding_weight_names=embedding_weight_names,
             lm_head_weight_names=lm_head_weight_names,
         ),
@@ -76,6 +78,7 @@ def _render_brainsurgery_plan(
     checkpoint_input_path: Path,
     output_checkpoint_path: Path,
     mapping_path: Path,
+    final_vocab_size: int,
     embedding_weight_names: Sequence[str],
     lm_head_weight_names: Sequence[str],
 ) -> str:
@@ -83,10 +86,12 @@ def _render_brainsurgery_plan(
         *_render_reindex_transforms(
             tensor_names=embedding_weight_names,
             mapping_path=mapping_path,
+            output_size=final_vocab_size,
         ),
         *_render_reindex_transforms(
             tensor_names=lm_head_weight_names,
             mapping_path=mapping_path,
+            output_size=final_vocab_size,
         ),
     ]
     lines = [
@@ -105,6 +110,7 @@ def _render_reindex_transforms(
     *,
     tensor_names: Sequence[str],
     mapping_path: Path,
+    output_size: int,
 ) -> list[str]:
     lines: list[str] = []
     for tensor_name in tensor_names:
@@ -113,10 +119,27 @@ def _render_reindex_transforms(
                 "  - reindex_token_ids:",
                 f"      target: {json.dumps(f'model::{tensor_name}')}",
                 f"      mapping: {json.dumps(str(mapping_path.resolve()))}",
+                f"      output_size: {output_size}",
                 "      keep_unmapped: false",
             ]
         )
     return lines
+
+
+def _load_final_vocab_size(destination_dir: Path, mapping_path: Path) -> int:
+    tokenizer_json_path = destination_dir / "tokenizer.json"
+    if tokenizer_json_path.exists():
+        tokenizer_data = json.loads(tokenizer_json_path.read_text(encoding="utf-8"))
+        model = tokenizer_data.get("model")
+        if isinstance(model, dict):
+            vocab = model.get("vocab")
+            if isinstance(vocab, dict):
+                return len(vocab)
+
+    mapping_data = json.loads(mapping_path.read_text(encoding="utf-8"))
+    if not isinstance(mapping_data, dict):
+        raise ValueError(f"Tokenizer mapping must be a JSON object: {mapping_path}")
+    return len(mapping_data)
 
 
 def _run_brainsurgery_plan(plan_path: Path) -> None:

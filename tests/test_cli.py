@@ -73,17 +73,73 @@ def test_sanitize_command_with_reassign_writes_mapping(
     assert tokenizer_data["model"]["vocab"]["<pad>"] == 0
     assert tokenizer_data["model"]["vocab"]["ab"] == 7
     assert tokenizer_data["model"]["vocab"]["xy"] == 8
+    assert tokenizer_data["model"]["vocab"]["a"] == 1
+    assert tokenizer_data["model"]["vocab"]["x"] == 4
 
     mapping_data = json.loads((destination / "tokenizer_mapping.json").read_text(encoding="utf-8"))
     assert mapping_data["8"] == 7
     assert mapping_data["7"] == 8
+    assert mapping_data["6"] == 6
+    assert mapping_data["0"] == 0
+    assert mapping_data["3"] == 1
+    assert mapping_data["1"] == 4
+
+
+def test_sanitize_command_verbose_prints_detail_sets(
+    sample_tokenizer_dir: Path,
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "cli-verbose-tokenizer"
+    token_map_path = tmp_path / "tokens.json"
+    special_token_map_path = tmp_path / "specials.json"
+    token_map_path.write_text(
+        json.dumps({"delete": ["ab"], "add": ["a", "ayz"]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    special_token_map_path.write_text(
+        json.dumps({"keep": ["<pad>"], "rename": {}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "sanitize",
+            str(sample_tokenizer_dir),
+            str(destination),
+            "--reassign",
+            "--token-map",
+            str(token_map_path),
+            "--special-token-map",
+            str(special_token_map_path),
+            "--verbose",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "warning" not in result.stderr.lower()
+    assert "Special tokens: kept=1, renamed=0, dropped=0" in result.stderr
+    assert "Tokens: delete_requested=1, rename_requested=0, deleted_total=2, add_requested=2, existing_ignored=1, requested_added=1, intermediate_added=1" in result.stderr
+    assert "Merges: added=2, deleted=2" in result.stderr
+    assert 'Requested token deletes: ["ab"]' in result.stderr
+    assert 'Requested token renames: {}' in result.stderr
+    assert 'Deleted tokens: ["ab", "abc"]' in result.stderr
+    assert 'Requested token adds: ["a", "ayz"]' in result.stderr
+    assert 'Existing add tokens ignored: ["a"]' in result.stderr
+    assert 'Requested added tokens: ["ayz"]' in result.stderr
+    assert 'Intermediate added tokens: ["yz"]' in result.stderr
+    assert 'Added merges: [["y", "z"], ["a", "yz"]]' in result.stderr
+    assert 'Kept special tokens: ["<pad>"]' in result.stderr
 
 
 def test_sanitize_command_rejects_special_token_map_without_reassign(
     tmp_path: Path,
 ) -> None:
     special_token_map_path = tmp_path / "specials.json"
-    special_token_map_path.write_text(json.dumps({"<pad>": None}) + "\n", encoding="utf-8")
+    special_token_map_path.write_text(
+        json.dumps({"keep": ["<pad>"], "rename": {}}, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
     result = _RUNNER.invoke(
         app,
@@ -91,13 +147,35 @@ def test_sanitize_command_rejects_special_token_map_without_reassign(
             "sanitize",
             "source",
             str(tmp_path / "destination"),
-            "--special-token-map-file",
+            "--special-token-map",
             str(special_token_map_path),
         ],
     )
 
     assert result.exit_code != 0
-    assert "--special-token-map-file requires --reassign" in result.stderr
+    assert "--special-token-map requires --reassign" in result.stderr
+
+
+def test_sanitize_command_rejects_token_map_without_reassign(tmp_path: Path) -> None:
+    token_map_path = tmp_path / "tokens.json"
+    token_map_path.write_text(
+        json.dumps({"delete": ["ab"], "add": ["newtok"]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    result = _RUNNER.invoke(
+        app,
+        [
+            "sanitize",
+            "source",
+            str(tmp_path / "destination"),
+            "--token-map",
+            str(token_map_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "--token-map requires --reassign" in result.stderr
 
 
 def test_download_command_downloads_into_models_repo_id(
