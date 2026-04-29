@@ -49,8 +49,10 @@ if [[ ${#default_args[@]} -gt 0 ]]; then
   set -- "${default_args[@]}" "$@"
 fi
 
-tokcleanse train models/odin-moe models/odin-danish models/odin-moe-trained-$1 \
-  --ind-file data/just-cp-cp-0-of-7-train.jinx \
-  --ood-file data/just-dyna-dyna-0-of-1-train.jinx \
-  --eval-file data/just-dyna-dyna-0-of-1-test.jinx \
+tokcleanse train models/odin-moe models/odin-danish models/odin-moe-trained-$exp \
+  --ind-file data/data/just-cp-cp-0-of-7-train.jinx \
+  --ood-file data/data/just-dyna-dyna-0-of-1-train.jinx \
+  --eval-file data/data/just-dyna-dyna-0-of-1-test.jinx \
+  --no-torch-compile \
+  --checkpoint-every 10000 \
   "$@"
