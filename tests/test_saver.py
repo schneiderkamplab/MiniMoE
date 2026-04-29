@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 from jinja2 import Environment
@@ -597,6 +598,27 @@ def test_save_reordered_tokenizer_with_token_map_deletes_cascade_and_adds_tokens
         "7": 9,
         "10": 10,
     }
+    initializer_data = json.loads(
+        (destination / "tokenizer_added_token_initializers.json").read_text(encoding="utf-8")
+    )
+    assert initializer_data == {
+        "7": [2, 6],
+        "8": [3, 2, 6],
+    }
+    token_group_data = json.loads(
+        (destination / "tokenizer_token_groups.json").read_text(encoding="utf-8")
+    )
+    assert token_group_data == {
+        "original_token_ids": [0, 1, 2, 3, 4, 5, 6, 9, 10],
+        "added_token_ids": [7, 8],
+        "requested_added_token_ids": [8],
+        "intermediate_added_token_ids": [7],
+        "special_token_ids": [0],
+        "added_tokens": ["yz", "ayz"],
+        "requested_added_tokens": ["ayz"],
+        "intermediate_added_tokens": ["yz"],
+        "special_tokens": ["<pad>"],
+    }
 
     tokenizer_config = json.loads((destination / "tokenizer_config.json").read_text(encoding="utf-8"))
     assert "added_tokens_encoder" not in tokenizer_config
@@ -637,3 +659,97 @@ def test_save_reordered_tokenizer_with_token_map_renames_tokens_and_merges(
         "AB c",
         "xy z",
     ]
+
+
+def test_save_reordered_tokenizer_strip_multimodal_rewrites_metadata(
+    sample_tokenizer_dir: Path,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-text-only"
+    shutil.copytree(sample_tokenizer_dir, source)
+    (source / "config.json").write_text(
+        json.dumps(
+                {
+                    "architectures": ["Gemma4ForConditionalGeneration"],
+                    "model_type": "gemma4",
+                    "text_config": {
+                        "model_type": "gemma4_text",
+                        "vocab_size": 11,
+                        "vocab_size_per_layer_input": 11,
+                        "hidden_size": 2304,
+                        "intermediate_size": 9216,
+                        "num_hidden_layers": 30,
+                        "num_attention_heads": 8,
+                        "num_key_value_heads": 4,
+                        "head_dim": 256,
+                        "hidden_activation": "gelu_pytorch_tanh",
+                        "max_position_embeddings": 131072,
+                        "initializer_range": 0.02,
+                        "rms_norm_eps": 1e-6,
+                        "use_cache": True,
+                        "pad_token_id": 0,
+                        "eos_token_id": 1,
+                        "bos_token_id": 2,
+                        "tie_word_embeddings": True,
+                        "attention_bias": False,
+                        "attention_dropout": 0.0,
+                        "sliding_window": 512,
+                    },
+                    "audio_config": {"model_type": "gemma4_audio"},
+                    "vision_config": {"model_type": "gemma4_vision"},
+                "audio_token_id": 11,
+                "image_token_id": 12,
+                "video_token_id": 13,
+                "boa_token_id": 14,
+                "boi_token_id": 15,
+                "eoa_token_index": 16,
+                "eoi_token_id": 17,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (source / "processor_config.json").write_text(
+        json.dumps({"processor_class": "Gemma4Processor", "image_seq_length": 280}, ensure_ascii=False, indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
+    tokenizer_config = json.loads((source / "tokenizer_config.json").read_text(encoding="utf-8"))
+    tokenizer_config.update(
+        {
+            "processor_class": "Gemma4Processor",
+            "audio_token": "<|audio|>",
+            "image_token": "<|image|>",
+            "video_token": "<|video|>",
+        }
+    )
+    (source / "tokenizer_config.json").write_text(
+        json.dumps(tokenizer_config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    destination = tmp_path / "saved-text-only"
+    save_reordered_tokenizer(
+        load_tokenizer_contents(source),
+        destination,
+        strip_multimodal=True,
+    )
+
+    config = json.loads((destination / "config.json").read_text(encoding="utf-8"))
+    assert config["architectures"] == ["Gemma4ForCausalLM"]
+    assert config["model_type"] == "gemma4_text"
+    assert "text_config" not in config
+    assert "audio_config" not in config
+    assert "vision_config" not in config
+    assert "audio_token_id" not in config
+    assert "image_token_id" not in config
+    assert "video_token_id" not in config
+
+    rewritten_tokenizer_config = json.loads((destination / "tokenizer_config.json").read_text(encoding="utf-8"))
+    assert "processor_class" not in rewritten_tokenizer_config
+    assert "audio_token" not in rewritten_tokenizer_config
+    assert "image_token" not in rewritten_tokenizer_config
+    assert "video_token" not in rewritten_tokenizer_config
+    assert not (destination / "processor_config.json").exists()

@@ -17,6 +17,9 @@ from .model_surgery import (
     rewrite_reassigned_model,
 )
 
+_TOKENIZER_ADDED_INITIALIZERS_FILENAME = "tokenizer_added_token_initializers.json"
+_TOKENIZER_TOKEN_GROUPS_FILENAME = "tokenizer_token_groups.json"
+
 
 @dataclass(frozen=True, slots=True)
 class _ReassignmentPlan:
@@ -82,6 +85,7 @@ def save_reordered_tokenizer(
     token_delete_literals: tuple[str, ...] = (),
     token_add_literals: tuple[str, ...] = (),
     token_rename_literals: dict[str, str] | None = None,
+    strip_multimodal: bool = False,
     embedding_weight_names: tuple[str, ...] = GEMMA4_DEFAULT_EMBEDDING_WEIGHT_NAMES,
     lm_head_weight_names: tuple[str, ...] = GEMMA4_DEFAULT_LM_HEAD_WEIGHT_NAMES,
 ) -> Path:
@@ -104,6 +108,7 @@ def save_reordered_tokenizer(
         token_delete_literals=token_delete_literals,
         token_add_literals=token_add_literals,
         token_rename_literals=token_rename_literals,
+        strip_multimodal=strip_multimodal,
         embedding_weight_names=embedding_weight_names,
         lm_head_weight_names=lm_head_weight_names,
     )
@@ -122,6 +127,7 @@ def _save_reordered_tokenizer_with_summary(
     token_delete_literals: tuple[str, ...] = (),
     token_add_literals: tuple[str, ...] = (),
     token_rename_literals: dict[str, str] | None = None,
+    strip_multimodal: bool = False,
     embedding_weight_names: tuple[str, ...] = GEMMA4_DEFAULT_EMBEDDING_WEIGHT_NAMES,
     lm_head_weight_names: tuple[str, ...] = GEMMA4_DEFAULT_LM_HEAD_WEIGHT_NAMES,
 ) -> tuple[Path, _SanitizeSummary]:
@@ -156,6 +162,8 @@ def _save_reordered_tokenizer_with_summary(
             add_literals=token_add_literals,
             rename_literals={} if token_rename_literals is None else token_rename_literals,
         )
+    if strip_multimodal:
+        _rewrite_text_only_metadata(destination_path)
     ordered_rules = topological_sort_rules(contents, order_name=order_name, seed=seed)
     if token_literal_rewrite_plan is not None:
         ordered_rules = [
@@ -196,7 +204,16 @@ def _save_reordered_tokenizer_with_summary(
             if token_literal_rewrite_plan is None
             else token_literal_rewrite_plan.added_literals,
         )
+        _write_added_token_initializers(
+            destination_path,
+            plan=plan,
+            token_literal_rewrite_plan=token_literal_rewrite_plan,
+        )
         _write_reassigned_tokenizer(destination_path, plan)
+        _write_token_group_metadata(
+            destination_path,
+            token_literal_rewrite_plan=token_literal_rewrite_plan,
+        )
         if special_token_rewrite_plan is not None:
             _rewrite_chat_template_files(destination_path, special_token_rewrite_plan)
         _write_tokenizer_mapping(destination_path, plan.mapping)
@@ -205,6 +222,15 @@ def _save_reordered_tokenizer_with_summary(
             destination_path,
             embedding_weight_names=embedding_weight_names,
             lm_head_weight_names=lm_head_weight_names,
+            strip_multimodal=strip_multimodal,
+        )
+    elif strip_multimodal:
+        rewrite_reassigned_model(
+            source_path,
+            destination_path,
+            embedding_weight_names=(),
+            lm_head_weight_names=(),
+            strip_multimodal=True,
         )
     summary = _build_sanitize_summary(
         special_token_rewrite_plan=special_token_rewrite_plan,
@@ -526,6 +552,158 @@ def _write_tokenizer_mapping(destination: Path, mapping: dict[int, int]) -> None
     }
     mapping_path.write_text(
         json.dumps(serialized_mapping, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_added_token_initializers(
+    destination: Path,
+    *,
+    plan: _ReassignmentPlan,
+    token_literal_rewrite_plan: _TokenLiteralRewritePlan | None,
+) -> None:
+    initializers_path = destination / _TOKENIZER_ADDED_INITIALIZERS_FILENAME
+    if token_literal_rewrite_plan is None or not token_literal_rewrite_plan.added_literals:
+        if initializers_path.exists():
+            initializers_path.unlink()
+        return
+
+    token_to_index = _load_token_to_index(_load_json_object(destination / "tokenizer.json"))
+    added_literals = set(token_literal_rewrite_plan.added_literals)
+    constituents: dict[str, tuple[str, ...]] = {
+        token: (token,)
+        for token in token_to_index
+        if token not in added_literals
+    }
+    for left, right in token_literal_rewrite_plan.added_merges:
+        merged = left + right
+        if merged not in added_literals:
+            continue
+        left_parts = constituents.get(left)
+        right_parts = constituents.get(right)
+        if left_parts is None or right_parts is None:
+            raise ValueError(
+                f"Missing constituent path for synthesized merge {left!r} + {right!r}"
+            )
+        constituents[merged] = (*left_parts, *right_parts)
+
+    serialized_initializers: dict[str, list[int]] = {}
+    for token in token_literal_rewrite_plan.added_literals:
+        source_parts = constituents.get(token)
+        if source_parts is None:
+            raise ValueError(f"Missing constituent path for added token {token!r}")
+        original_id = token_to_index[token]
+        final_id = plan.full_mapping[original_id]
+        serialized_initializers[str(final_id)] = [
+            token_to_index[source_part]
+            for source_part in source_parts
+        ]
+
+    initializers_path.write_text(
+        json.dumps(
+            dict(sorted(serialized_initializers.items(), key=lambda item: int(item[0]))),
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _write_token_group_metadata(
+    destination: Path,
+    *,
+    token_literal_rewrite_plan: _TokenLiteralRewritePlan | None,
+) -> None:
+    metadata_path = destination / _TOKENIZER_TOKEN_GROUPS_FILENAME
+    tokenizer_data = _load_json_object(destination / "tokenizer.json")
+    token_to_index = _load_token_to_index(tokenizer_data)
+    added_tokens = ()
+    requested_added_tokens = ()
+    intermediate_added_tokens = ()
+    if token_literal_rewrite_plan is not None:
+        added_tokens = tuple(token_literal_rewrite_plan.added_literals)
+        requested_added_tokens = tuple(token_literal_rewrite_plan.requested_added_literals)
+        requested_added_set = set(requested_added_tokens)
+        intermediate_added_tokens = tuple(
+            token
+            for token in token_literal_rewrite_plan.added_literals
+            if token not in requested_added_set
+        )
+    added_token_set = set(added_tokens)
+    special_tokens = _collect_special_tokens(destination, tokenizer_data)
+
+    metadata = {
+        "original_token_ids": sorted(
+            token_id
+            for token, token_id in token_to_index.items()
+            if token not in added_token_set
+        ),
+        "added_token_ids": _token_ids_for_literals(token_to_index, added_tokens),
+        "requested_added_token_ids": _token_ids_for_literals(token_to_index, requested_added_tokens),
+        "intermediate_added_token_ids": _token_ids_for_literals(token_to_index, intermediate_added_tokens),
+        "special_token_ids": _token_ids_for_literals(token_to_index, special_tokens),
+        "added_tokens": list(added_tokens),
+        "requested_added_tokens": list(requested_added_tokens),
+        "intermediate_added_tokens": list(intermediate_added_tokens),
+        "special_tokens": list(special_tokens),
+    }
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _token_ids_for_literals(
+    token_to_index: dict[str, int],
+    literals: tuple[str, ...],
+) -> list[int]:
+    return [
+        token_to_index[literal]
+        for literal in literals
+        if literal in token_to_index
+    ]
+
+
+def _rewrite_text_only_metadata(destination: Path) -> None:
+    _rewrite_text_only_config_file(destination / "config.json")
+    _rewrite_text_only_tokenizer_config(destination / "tokenizer_config.json")
+    processor_config_path = destination / "processor_config.json"
+    if processor_config_path.exists():
+        processor_config_path.unlink()
+
+
+def _rewrite_text_only_config_file(path: Path) -> None:
+    if not path.exists():
+        return
+    data = _load_json_object(path)
+    text_config = data.get("text_config")
+    if not isinstance(text_config, dict):
+        raise ValueError(f"{path} is missing text_config required for Gemma4 text-only normalization")
+    normalized = dict(text_config)
+    normalized["architectures"] = ["Gemma4ForCausalLM"]
+    normalized["model_type"] = "gemma4_text"
+    if "_name_or_path" in data and "_name_or_path" not in normalized:
+        normalized["_name_or_path"] = data["_name_or_path"]
+    path.write_text(
+        json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _rewrite_text_only_tokenizer_config(path: Path) -> None:
+    if not path.exists():
+        return
+    data = _load_json_object(path)
+    for key in (
+        "audio_token",
+        "image_token",
+        "video_token",
+        "processor_class",
+    ):
+        data.pop(key, None)
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 

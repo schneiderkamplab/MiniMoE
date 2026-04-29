@@ -1,0 +1,29 @@
+#!/bin/bash
+scripts/odin-moe-train.sh 0 \
+  --overwrite \
+  --steps 100000 \
+  --print-every 1 \
+  --batch-size 4 \
+  --gradient-accumulation 4 \
+  --max-length 256 \
+  --pad-to-max-length \
+  --no-gradient-checkpointing \
+  --learning-rate 2.5e-5 \
+  --lr-warmup-steps 1000 \
+  --distill-ind \
+  --no-distill-ood \
+  --distill-original-tokens-only \
+  --ind-batches-per-cycle 1 \
+  --ood-batches-per-cycle 3 \
+  --ind-lm-weight 0.05 \
+  --ind-distill-weight 2.0 \
+  --ind-route-weight 0.1 \
+  --ind-route-logit-bias -2.0 \
+  --ood-lm-weight 1.0 \
+  --ood-route-weight 0.10 \
+  --ood-route-logit-bias 2.0 \
+  --route-logit-bias-anneal-steps 12500 \
+  --router-learning-rate-multiplier 100 \
+  --weight-diff-every 1 \
+  --eval-every 100 \
+  --eval-max-batches 32
