@@ -6,4 +6,5 @@ repo_root="$(cd "${script_dir}/.." && pwd)"
 
 cd "${repo_root}"
 
+tokcleanse download google/gemma-4-E2B-it
 tokcleanse sanitize google/gemma-4-E2B-it models/odin-danish --overwrite --reassign --token-map examples/danish_tokens.json --special-token-map examples/html_tokens.json "$@"
