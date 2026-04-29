@@ -15,6 +15,8 @@ from typing import Any, Literal
 
 from tqdm import tqdm
 
+from ._moe import _load_causal_lm_for_runtime, _load_tokenizer_for_runtime
+
 DEFAULT_COMPARE_PROMPT = "Who are you?"
 DEFAULT_GENERATION_BATCH_SIZE = 8
 DEFAULT_SEMANTIC_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
@@ -54,6 +56,30 @@ class ComparisonSummary:
     mean_semantic_similarity: float
 
 
+@dataclass(frozen=True, slots=True)
+class PromptLogitDiff:
+    """Logit-difference result for one prompt."""
+
+    prompt: str
+    token_count: int
+    max_abs_diff: float
+    mean_abs_diff: float
+    rmse: float
+    allclose: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LogitDiffSummary:
+    """Aggregate statistics across prompt logit comparisons."""
+
+    total: int
+    allclose_prompts: int
+    global_max_abs_diff: float
+    mean_max_abs_diff: float
+    mean_mean_abs_diff: float
+    mean_rmse: float
+
+
 def load_prompts(
     *,
     prompt_texts: list[str] | tuple[str, ...],
@@ -68,6 +94,109 @@ def load_prompts(
     if not prompts:
         return (DEFAULT_COMPARE_PROMPT,)
     return tuple(prompts)
+
+
+def compare_model_logits(
+    model_a: str | Path,
+    model_b: str | Path,
+    *,
+    prompts: list[str] | tuple[str, ...],
+    completion: bool = False,
+    batch_size: int = DEFAULT_GENERATION_BATCH_SIZE,
+    device: CompareDevice = "auto",
+    dtype: CompareDType = "auto",
+    max_length: int = 1024,
+    atol: float = 1e-5,
+    rtol: float = 1e-5,
+) -> tuple[PromptLogitDiff, ...]:
+    """Compare prompt-conditioned logits between two aligned models."""
+
+    import torch
+
+    if batch_size < 1:
+        raise ValueError("--batch-size must be at least 1")
+    if max_length < 1:
+        raise ValueError("--max-length must be at least 1")
+    if atol < 0:
+        raise ValueError("--atol must be non-negative")
+    if rtol < 0:
+        raise ValueError("--rtol must be non-negative")
+
+    resolved_device = _resolve_device(torch, device)
+    resolved_dtype = _resolve_dtype(torch, dtype)
+    prompts_tuple = tuple(prompts)
+
+    tokenizer_a = None
+    tokenizer_b = None
+    model_a_loaded = None
+    model_b_loaded = None
+    try:
+        tokenizer_a = _load_tokenizer_for_runtime(str(model_a))
+        tokenizer_b = _load_tokenizer_for_runtime(str(model_b))
+        _prepare_generation_tokenizer(tokenizer_a)
+        _prepare_generation_tokenizer(tokenizer_b)
+        model_a_loaded = _load_causal_lm_for_runtime(
+            model_path=str(model_a),
+            dtype=resolved_dtype,
+            device=resolved_device,
+        )
+        model_b_loaded = _load_causal_lm_for_runtime(
+            model_path=str(model_b),
+            dtype=resolved_dtype,
+            device=resolved_device,
+        )
+        model_a_loaded.eval()
+        model_b_loaded.eval()
+        model_a_loaded.to(resolved_device)
+        model_b_loaded.to(resolved_device)
+
+        results: list[PromptLogitDiff] = []
+        num_batches = (len(prompts_tuple) + batch_size - 1) // batch_size
+        for start in tqdm(
+            range(0, len(prompts_tuple), batch_size),
+            total=num_batches,
+            desc=f"Comparing logits {_display_name(model_a)} vs {_display_name(model_b)}",
+            unit="batch",
+        ):
+            batch_prompts = prompts_tuple[start : start + batch_size]
+            encoded_cpu = _encode_shared_prompt_batch(
+                tokenizer_a=tokenizer_a,
+                tokenizer_b=tokenizer_b,
+                prompts=batch_prompts,
+                completion=completion,
+                max_length=max_length,
+            )
+            encoded = _move_to_device(encoded_cpu, resolved_device)
+            with torch.inference_mode():
+                logits_a = model_a_loaded(**encoded).logits.float().cpu()
+                logits_b = model_b_loaded(**encoded).logits.float().cpu()
+            if logits_a.shape != logits_b.shape:
+                raise ValueError(
+                    f"Logit shapes differ between models: {tuple(logits_a.shape)} vs {tuple(logits_b.shape)}"
+                )
+            attention_mask = encoded_cpu["attention_mask"].cpu()
+            results.extend(
+                _summarize_batch_logit_diffs(
+                    prompts=batch_prompts,
+                    logits_a=logits_a,
+                    logits_b=logits_b,
+                    attention_mask=attention_mask,
+                    atol=atol,
+                    rtol=rtol,
+                    torch_module=torch,
+                )
+            )
+        return tuple(results)
+    finally:
+        if model_a_loaded is not None:
+            del model_a_loaded
+        if model_b_loaded is not None:
+            del model_b_loaded
+        if tokenizer_a is not None:
+            del tokenizer_a
+        if tokenizer_b is not None:
+            del tokenizer_b
+        _release_resources(torch_module=torch)
 
 
 def compare_models(
@@ -252,6 +381,55 @@ def serialize_summary(
     return json.dumps({"summary": asdict(summarize_comparisons(comparisons))}, ensure_ascii=False)
 
 
+def summarize_logit_diffs(
+    diffs: list[PromptLogitDiff] | tuple[PromptLogitDiff, ...],
+) -> LogitDiffSummary:
+    """Build aggregate prompt-logit comparison statistics."""
+
+    total = len(diffs)
+    if total == 0:
+        return LogitDiffSummary(
+            total=0,
+            allclose_prompts=0,
+            global_max_abs_diff=0.0,
+            mean_max_abs_diff=0.0,
+            mean_mean_abs_diff=0.0,
+            mean_rmse=0.0,
+        )
+    return LogitDiffSummary(
+        total=total,
+        allclose_prompts=sum(diff.allclose for diff in diffs),
+        global_max_abs_diff=max(diff.max_abs_diff for diff in diffs),
+        mean_max_abs_diff=sum(diff.max_abs_diff for diff in diffs) / total,
+        mean_mean_abs_diff=sum(diff.mean_abs_diff for diff in diffs) / total,
+        mean_rmse=sum(diff.rmse for diff in diffs) / total,
+    )
+
+
+def serialize_logit_diffs(
+    diffs: list[PromptLogitDiff] | tuple[PromptLogitDiff, ...],
+) -> tuple[str, ...]:
+    """Serialize prompt logit diffs and a summary to JSONL-style strings."""
+
+    return serialize_prompt_logit_diffs(diffs) + (serialize_logit_diff_summary(diffs),)
+
+
+def serialize_prompt_logit_diffs(
+    diffs: list[PromptLogitDiff] | tuple[PromptLogitDiff, ...],
+) -> tuple[str, ...]:
+    """Serialize prompt logit diffs to JSONL-style strings."""
+
+    return tuple(json.dumps(asdict(diff), ensure_ascii=False) for diff in diffs)
+
+
+def serialize_logit_diff_summary(
+    diffs: list[PromptLogitDiff] | tuple[PromptLogitDiff, ...],
+) -> str:
+    """Serialize aggregate prompt-logit statistics to one JSON string."""
+
+    return json.dumps({"summary": asdict(summarize_logit_diffs(diffs))}, ensure_ascii=False)
+
+
 def comparison_has_any_mismatch(comparison: PromptComparison) -> bool:
     """Return whether any comparison signal indicates a mismatch."""
 
@@ -274,14 +452,18 @@ def _generate_answers_for_model(
     dtype: Any,
     torch_module: Any,
 ) -> tuple[str, ...]:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     tokenizer = None
     model = None
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        tokenizer = _load_tokenizer_for_runtime(str(model_path))
         _prepare_generation_tokenizer(tokenizer)
-        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype)
+        model = _load_causal_lm_for_runtime(
+            model_path=str(model_path),
+            dtype=dtype,
+            device=device,
+        )
         model.eval()
         model.to(device)
         answers = []
@@ -352,6 +534,84 @@ def _load_prompts_from_jsonl(path: Path) -> list[str]:
     return prompts
 
 
+def _encode_shared_prompt_batch(
+    *,
+    tokenizer_a: Any,
+    tokenizer_b: Any,
+    prompts: tuple[str, ...],
+    completion: bool,
+    max_length: int,
+) -> dict[str, Any]:
+    encoded_a = _encode_prompt_batch(
+        tokenizer=tokenizer_a,
+        prompts=prompts,
+        completion=completion,
+        max_length=max_length,
+    )
+    encoded_b = _encode_prompt_batch(
+        tokenizer=tokenizer_b,
+        prompts=prompts,
+        completion=completion,
+        max_length=max_length,
+    )
+    required_keys = ("input_ids", "attention_mask")
+    for key in required_keys:
+        if key not in encoded_a or key not in encoded_b:
+            raise ValueError(f"Missing {key} while encoding prompts for logit diff")
+        tensor_a = encoded_a[key]
+        tensor_b = encoded_b[key]
+        if tensor_a.shape != tensor_b.shape:
+            raise ValueError(
+                f"Logit diff requires aligned tokenization, but {key} shapes differ: "
+                f"{tuple(tensor_a.shape)} vs {tuple(tensor_b.shape)}"
+            )
+        if not tensor_a.equal(tensor_b):
+            raise ValueError(
+                "Logit diff requires aligned tokenization, but encoded prompt ids differ between models"
+            )
+    return encoded_a
+
+
+def _summarize_batch_logit_diffs(
+    *,
+    prompts: tuple[str, ...],
+    logits_a: Any,
+    logits_b: Any,
+    attention_mask: Any,
+    atol: float,
+    rtol: float,
+    torch_module: Any,
+) -> tuple[PromptLogitDiff, ...]:
+    results: list[PromptLogitDiff] = []
+    for index, prompt in enumerate(prompts):
+        valid_positions = attention_mask[index].bool()
+        token_count = int(valid_positions.sum().item())
+        if token_count == 0:
+            raise ValueError("Encountered an empty encoded prompt while computing logit diff")
+        prompt_logits_a = logits_a[index][valid_positions]
+        prompt_logits_b = logits_b[index][valid_positions]
+        diff = prompt_logits_a - prompt_logits_b
+        abs_diff = diff.abs()
+        results.append(
+            PromptLogitDiff(
+                prompt=prompt,
+                token_count=token_count,
+                max_abs_diff=float(abs_diff.max().item()),
+                mean_abs_diff=float(abs_diff.mean().item()),
+                rmse=float(diff.pow(2).mean().sqrt().item()),
+                allclose=bool(
+                    torch_module.allclose(
+                        prompt_logits_a,
+                        prompt_logits_b,
+                        atol=atol,
+                        rtol=rtol,
+                    )
+                ),
+            )
+        )
+    return tuple(results)
+
+
 def _generate_answer(
     *,
     tokenizer: Any,
@@ -408,9 +668,18 @@ def _encode_prompt_batch(
     tokenizer: Any,
     prompts: tuple[str, ...],
     completion: bool,
+    max_length: int | None = None,
 ) -> dict[str, Any]:
     if completion:
-        return dict(tokenizer(list(prompts), return_tensors="pt", padding=True))
+        return dict(
+            tokenizer(
+                list(prompts),
+                return_tensors="pt",
+                padding=True,
+                truncation=max_length is not None,
+                max_length=max_length,
+            )
+        )
     if not hasattr(tokenizer, "apply_chat_template"):
         raise ValueError("Tokenizer does not support chat templates; use --completion instead")
     rendered_prompts = [
@@ -421,7 +690,15 @@ def _encode_prompt_batch(
         )
         for prompt in prompts
     ]
-    return dict(tokenizer(rendered_prompts, return_tensors="pt", padding=True))
+    return dict(
+        tokenizer(
+            rendered_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=max_length is not None,
+            max_length=max_length,
+        )
+    )
 
 
 def _build_deterministic_generation_config(model: Any) -> Any:
@@ -528,7 +805,13 @@ def _clear_torch_cache(torch_module: Any) -> None:
     if torch_module.cuda.is_available():
         torch_module.cuda.empty_cache()
     mps_module = getattr(torch_module, "mps", None)
-    if mps_module is not None and hasattr(mps_module, "empty_cache"):
+    mps_is_available = (
+        mps_module is not None
+        and hasattr(mps_module, "empty_cache")
+        and hasattr(mps_module, "is_available")
+        and mps_module.is_available()
+    )
+    if mps_is_available:
         mps_module.empty_cache()
 
 
@@ -637,12 +920,16 @@ class _LlmJudge:
         dtype: Any,
         torch_module: Any,
     ) -> None:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
 
         self._torch = torch_module
         self._device = device
         self._tokenizer = AutoTokenizer.from_pretrained(judge_model)
-        self._model = AutoModelForCausalLM.from_pretrained(judge_model, dtype=dtype)
+        self._model = _load_causal_lm_for_runtime(
+            model_path=str(judge_model),
+            dtype=dtype,
+            device=device,
+        )
         self._model.eval()
         self._model.to(device)
 
@@ -720,13 +1007,20 @@ __all__ = [
     "DEFAULT_COMPARE_PROMPT",
     "DEFAULT_SEMANTIC_MODEL_NAME",
     "DEFAULT_SEMANTIC_THRESHOLD",
+    "LogitDiffSummary",
     "PromptComparison",
+    "PromptLogitDiff",
     "comparison_has_any_mismatch",
+    "compare_model_logits",
     "compare_models",
     "load_prompts",
     "resolve_compare_device",
     "serialize_comparisons",
+    "serialize_logit_diff_summary",
+    "serialize_logit_diffs",
+    "serialize_prompt_logit_diffs",
     "serialize_prompt_comparisons",
+    "summarize_logit_diffs",
     "serialize_summary",
     "summarize_comparisons",
 ]
