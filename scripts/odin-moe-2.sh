@@ -1,6 +1,6 @@
 #!/bin/bash
-scripts/odin-moe-train.sh 0 \
-  --checkpoint-dir checkpoints/odin-moe-1 \
+scripts/odin-moe-train.sh 2 \
+  --checkpoint-dir checkpoints/odin-moe-2 \
   --overwrite \
   --steps 100000 \
   --print-every 1 \
