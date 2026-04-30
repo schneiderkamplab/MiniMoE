@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "${script_dir}/.." && pwd)"
+
+cd "${repo_root}"
+
+exp="0"
+if [[ $# -gt 0 && "${1}" != --* ]]; then
+  exp="${1}"
+  shift
+fi
+
+student_model="models/mini-moe"
+teacher_model="models/odin-danish"
+output_dir="models/mini-moe-trained-${exp}"
+
+if [[ ! -f "${student_model}/config.json" ]]; then
+  "${script_dir}/create-mini-moe.py" --destination "${student_model}"
+fi
+
+default_args=()
+has_batch_size=0
+has_gradient_accumulation=0
+has_max_length=0
+has_gradient_checkpointing_flag=0
+has_checkpoint_dir=0
+
+for arg in "$@"; do
+  case "${arg}" in
+    --batch-size)
+      has_batch_size=1
+      ;;
+    --gradient-accumulation)
+      has_gradient_accumulation=1
+      ;;
+    --max-length)
+      has_max_length=1
+      ;;
+    --gradient-checkpointing|--no-gradient-checkpointing)
+      has_gradient_checkpointing_flag=1
+      ;;
+    --checkpoint-dir)
+      has_checkpoint_dir=1
+      ;;
+  esac
+done
+
+if [[ ${has_batch_size} -eq 0 ]]; then
+  default_args+=(--batch-size 4)
+fi
+if [[ ${has_gradient_accumulation} -eq 0 ]]; then
+  default_args+=(--gradient-accumulation 4)
+fi
+if [[ ${has_max_length} -eq 0 ]]; then
+  default_args+=(--max-length 256)
+fi
+if [[ ${has_gradient_checkpointing_flag} -eq 0 ]]; then
+  default_args+=(--no-gradient-checkpointing)
+fi
+if [[ ${has_checkpoint_dir} -eq 0 ]]; then
+  default_args+=(--checkpoint-dir "checkpoints/mini-moe-${exp}")
+fi
+
+if [[ ${#default_args[@]} -gt 0 ]]; then
+  set -- "${default_args[@]}" "$@"
+fi
+
+tokcleanse train "${student_model}" "${teacher_model}" "${output_dir}" \
+  --ind-file data/data/just-cp-cp-0-of-7-train.jinx \
+  --ood-file data/data/just-dyna-dyna-0-of-1-train.jinx \
+  --eval-file data/data/just-dyna-dyna-0-of-1-test.jinx \
+  --no-torch-compile \
+  --checkpoint-every 10000 \
+  "$@"

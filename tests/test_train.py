@@ -13,7 +13,10 @@ import torch
 from tokcleanse.train import (
     _CorpusStream,
     _LanguageScheduler,
+    _RouteBiasAnnealer,
+    _build_training_configuration_state,
     _build_learning_rate_scheduler,
+    _capture_training_random_generator_state,
     _capture_mps_memory_snapshot,
     _compute_distillation_loss,
     _compute_expert_pair_weight_diff_metrics,
@@ -24,10 +27,14 @@ from tokcleanse.train import (
     _masked_row_parameter_ids,
     _print_training_metrics,
     _release_mps_working_set,
+    _restore_training_random_generator_state,
     _resolve_torch_compile,
     _resolve_training_steps,
     _should_run_distillation,
     _tokenize_batch,
+    _validate_resume_training_configuration,
+    TokenGroupMetadata,
+    TrainingParameterSelection,
     build_training_dry_run_report,
     load_token_group_metadata,
     prepare_student_for_distillation,
@@ -181,6 +188,7 @@ def test_prepare_student_for_distillation_freezes_shared_weights_and_masks_added
     model = _DummyModel()
     metadata_dir = tmp_path / "model"
     metadata_dir.mkdir()
+    (metadata_dir / "config.json").write_text("{}\n", encoding="utf-8")
     (metadata_dir / "tokenizer_token_groups.json").write_text(
         json.dumps(
             {
@@ -232,6 +240,91 @@ def test_prepare_student_for_distillation_freezes_shared_weights_and_masks_added
     assert torch.count_nonzero(model.model.layers[0].experts.down_proj.grad[0]) == 0
     assert torch.count_nonzero(model.model.layers[0].experts.gate_up_proj.grad[1]) > 0
     assert torch.count_nonzero(model.model.layers[0].experts.down_proj.grad[1]) > 0
+
+
+def test_prepare_student_for_distillation_honors_parameter_selection() -> None:
+    model = _DummyModel()
+    token_groups = TokenGroupMetadata(
+        original_token_ids=(0, 2, 4, 5),
+        added_token_ids=(1, 3),
+        requested_added_token_ids=(3,),
+        intermediate_added_token_ids=(1,),
+        special_token_ids=(0,),
+        added_tokens=("yz", "ayz"),
+        requested_added_tokens=("ayz",),
+        intermediate_added_tokens=("yz",),
+        special_tokens=("<pad>",),
+    )
+
+    prepare_student_for_distillation(
+        model,
+        token_groups=token_groups,
+        torch_module=torch,
+        parameter_selection=TrainingParameterSelection(
+            shared=True,
+            expert_0=True,
+            expert_1=False,
+            embedding_lm_head=False,
+        ),
+    )
+
+    named_parameters = dict(model.named_parameters())
+    assert named_parameters["model.layers.0.self_attn.weight"].requires_grad
+    assert named_parameters["model.layers.0.experts.gate_up_proj"].requires_grad
+    assert named_parameters["model.layers.0.experts.down_proj"].requires_grad
+    assert named_parameters["model.layers.0.router.proj.weight"].requires_grad
+    assert not named_parameters["model.embed_tokens.weight"].requires_grad
+    assert not named_parameters["lm_head.weight"].requires_grad
+
+    loss = (
+        model.model.layers[0].experts.gate_up_proj.sum()
+        + model.model.layers[0].experts.down_proj.sum()
+    )
+    loss.backward()
+
+    assert torch.count_nonzero(model.model.layers[0].experts.gate_up_proj.grad[0]) > 0
+    assert torch.count_nonzero(model.model.layers[0].experts.down_proj.grad[0]) > 0
+    assert torch.count_nonzero(model.model.layers[0].experts.gate_up_proj.grad[1]) == 0
+    assert torch.count_nonzero(model.model.layers[0].experts.down_proj.grad[1]) == 0
+
+
+def test_prepare_student_for_distillation_can_train_full_embedding_lm_head() -> None:
+    model = _DummyModel()
+    token_groups = TokenGroupMetadata(
+        original_token_ids=(0, 2, 4, 5),
+        added_token_ids=(1, 3),
+        requested_added_token_ids=(3,),
+        intermediate_added_token_ids=(1,),
+        special_token_ids=(0,),
+        added_tokens=("yz", "ayz"),
+        requested_added_tokens=("ayz",),
+        intermediate_added_tokens=("yz",),
+        special_tokens=("<pad>",),
+    )
+
+    prepare_student_for_distillation(
+        model,
+        token_groups=token_groups,
+        torch_module=torch,
+        parameter_selection=TrainingParameterSelection(
+            shared=False,
+            expert_0=False,
+            expert_1=False,
+            embedding_lm_head=True,
+            full_embedding_lm_head=True,
+        ),
+    )
+
+    named_parameters = dict(model.named_parameters())
+    assert named_parameters["model.embed_tokens.weight"].requires_grad
+    assert named_parameters["lm_head.weight"].requires_grad
+    assert not named_parameters["model.layers.0.self_attn.weight"].requires_grad
+
+    loss = model.model.embed_tokens.weight.sum() + model.lm_head.weight.sum()
+    loss.backward()
+
+    assert torch.all(named_parameters["model.embed_tokens.weight"].grad == 1)
+    assert torch.all(named_parameters["lm_head.weight"].grad == 1)
 
 
 def test_compute_expert_pair_weight_diff_metrics() -> None:
@@ -532,6 +625,7 @@ def test_build_training_dry_run_report_lists_trainable_parameters(
 
     metadata_dir = tmp_path / "model"
     metadata_dir.mkdir()
+    (metadata_dir / "config.json").write_text("{}\n", encoding="utf-8")
     (metadata_dir / "tokenizer_token_groups.json").write_text(
         json.dumps(
             {
@@ -697,6 +791,111 @@ def test_corpus_stream_state_dict_restores_position(tmp_path: Path) -> None:
 
     assert consumed
     assert actual_next == expected_next
+
+
+def test_training_random_generator_state_restores_python_and_torch() -> None:
+    random.seed(123)
+    torch.manual_seed(123)
+    state_dict = _capture_training_random_generator_state(torch_module=torch)
+    expected_python_values = [random.random() for _ in range(3)]
+    expected_torch_values = torch.rand(3)
+
+    random.seed(999)
+    torch.manual_seed(999)
+    _restore_training_random_generator_state(
+        resume_state={"random_generator_state_dict": state_dict},
+        torch_module=torch,
+    )
+
+    assert [random.random() for _ in range(3)] == expected_python_values
+    assert torch.equal(torch.rand(3), expected_torch_values)
+
+
+def test_route_bias_annealer_pauses_above_threshold_and_advances_below() -> None:
+    annealer = _RouteBiasAnnealer(anneal_steps=4, loss_threshold=0.05)
+
+    assert annealer.scale() == pytest.approx(1.0)
+    assert annealer.observe_route_loss(0.051) is False
+    assert annealer.completed_anneal_steps == 0
+    assert annealer.scale() == pytest.approx(1.0)
+
+    assert annealer.observe_route_loss(0.05) is True
+    assert annealer.completed_anneal_steps == 1
+    assert annealer.scale() == pytest.approx(0.75)
+
+    state = annealer.state_dict()
+    restored = _RouteBiasAnnealer(anneal_steps=4, loss_threshold=0.05)
+    restored.load_state_dict(state)
+    assert restored.completed_anneal_steps == 1
+    assert restored.scale() == pytest.approx(0.75)
+
+
+def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: Path) -> None:
+    configuration = _build_training_configuration_state(
+        resolved_steps=100,
+        resolved_epochs=None,
+        teacher_model=tmp_path / "teacher",
+        ind_files=(tmp_path / "ind.txt",),
+        ood_files=(tmp_path / "ood.txt",),
+        eval_files=(),
+        resolved_device="cpu",
+        dtype="float32",
+        batch_size=4,
+        eval_batch_size=4,
+        eval_max_batches=32,
+        weight_diff_every=25,
+        pad_to_max_length=True,
+        torch_compile=False,
+        distill_ind=False,
+        distill_ood=False,
+        distill_original_tokens_only=False,
+        distill_every=1,
+        lr_warmup_steps=25,
+        gradient_accumulation_steps=4,
+        gradient_checkpointing=False,
+        max_length=256,
+        learning_rate=1e-3,
+        weight_decay=0.0,
+        distill_kl_vocab_chunk_size=0,
+        checkpoint_every=25,
+        checkpoint_dir=tmp_path / "checkpoints",
+        eval_every_steps=25,
+        log_every=1,
+        print_every=1,
+        ind_batches_per_cycle=1,
+        ood_batches_per_cycle=1,
+        ind_lm_weight=1.0,
+        ind_distill_weight=0.0,
+        ind_route_weight=0.02,
+        ind_route_logit_bias=-1.25,
+        ood_lm_weight=1.0,
+        ood_distill_weight=0.0,
+        ood_route_weight=0.02,
+        ood_route_logit_bias=1.25,
+        route_logit_bias_anneal_steps=750,
+        route_logit_bias_anneal_loss_threshold=5e-2,
+        router_learning_rate_multiplier=1.0,
+        parameter_selection=TrainingParameterSelection(
+            shared=True,
+            expert_0=True,
+            expert_1=True,
+            embedding_lm_head=True,
+            full_embedding_lm_head=True,
+        ),
+        seed=0,
+    )
+    changed_configuration = dict(configuration)
+    changed_configuration["route_logit_bias_anneal_steps"] = 500
+
+    _validate_resume_training_configuration(
+        resume_state={"training_configuration": configuration},
+        training_configuration_state=configuration,
+    )
+    with pytest.raises(ValueError, match="route_logit_bias_anneal_steps"):
+        _validate_resume_training_configuration(
+            resume_state={"training_configuration": configuration},
+            training_configuration_state=changed_configuration,
+        )
 
 
 def test_print_training_metrics_includes_timing_fields_when_present() -> None:
