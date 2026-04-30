@@ -765,6 +765,9 @@ def test_train_command_invokes_distillation_training(
         gradient_checkpointing: bool,
         max_length: int,
         learning_rate: float,
+        router_learning_rate: float,
+        router_lr_anneal_steps: int,
+        router_min_learning_rate: float,
         weight_decay: float,
         checkpoint_every: int,
         checkpoint_dir: Path | None,
@@ -783,7 +786,6 @@ def test_train_command_invokes_distillation_training(
         ood_route_logit_bias: float,
         route_logit_bias_anneal_steps: int,
         route_logit_bias_anneal_loss_threshold: float,
-        router_learning_rate_multiplier: float,
         train_shared: bool,
         train_expert_0: bool,
         train_expert_1: bool,
@@ -810,6 +812,9 @@ def test_train_command_invokes_distillation_training(
         assert gradient_checkpointing is True
         assert max_length == 512
         assert learning_rate == 2e-4
+        assert router_learning_rate == 0.002
+        assert router_lr_anneal_steps == 75
+        assert router_min_learning_rate == 2e-6
         assert weight_decay == 0.1
         assert checkpoint_every == 50
         assert checkpoint_dir == tmp_path / "checkpoints"
@@ -828,7 +833,6 @@ def test_train_command_invokes_distillation_training(
         assert ood_route_logit_bias == 0.0
         assert route_logit_bias_anneal_steps == 0
         assert route_logit_bias_anneal_loss_threshold == 0.25
-        assert router_learning_rate_multiplier == 1.0
         assert train_shared is True
         assert train_expert_0 is True
         assert train_expert_1 is False
@@ -866,6 +870,12 @@ def test_train_command_invokes_distillation_training(
             "512",
             "--learning-rate",
             "2e-4",
+            "--router-learning-rate",
+            "2e-3",
+            "--router-lr-anneal-steps",
+            "75",
+            "--router-min-learning-rate",
+            "2e-6",
             "--weight-decay",
             "0.1",
             "--checkpoint-every",
@@ -944,6 +954,9 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "gradient_accumulation_steps": 8,
                 "gradient_checkpointing": True,
                 "learning_rate": 5e-5,
+                "router_learning_rate": 1e-3,
+                "router_lr_anneal_steps": 100,
+                "router_min_learning_rate": 1e-6,
                 "weight_decay": 0.0,
                 "distill_kl_vocab_chunk_size": 0,
                 "ind_route_weight": 0.0,
@@ -952,7 +965,6 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "ood_route_logit_bias": 0.0,
                 "route_logit_bias_anneal_steps": 0,
                 "route_logit_bias_anneal_loss_threshold": 5e-2,
-                "router_learning_rate_multiplier": 1.0,
                 "train_shared": False,
                 "train_expert_0": False,
                 "train_expert_1": True,
@@ -1001,6 +1013,9 @@ def test_train_command_dry_run_prints_report_and_skips_training(
     assert dry_run_payload["dry_run"]["added_token_ids"] == [1, 3]
     assert dry_run_payload["dry_run"]["gradient_accumulation"] == 8
     assert dry_run_payload["dry_run"]["gradient_checkpointing"] is True
+    assert dry_run_payload["dry_run"]["router_learning_rate"] == 1e-3
+    assert dry_run_payload["dry_run"]["router_lr_anneal_steps"] == 100
+    assert dry_run_payload["dry_run"]["router_min_learning_rate"] == 1e-6
     assert dry_run_payload["dry_run"]["route_logit_bias_anneal_loss_threshold"] == 5e-2
     assert dry_run_payload["dry_run"]["train_shared"] is False
     assert dry_run_payload["dry_run"]["train_expert_0"] is False
@@ -1035,6 +1050,9 @@ def test_train_command_defaults_checkpoint_every_to_eval_steps(
         gradient_checkpointing: bool,
         max_length: int,
         learning_rate: float,
+        router_learning_rate: float,
+        router_lr_anneal_steps: int,
+        router_min_learning_rate: float,
         weight_decay: float,
         checkpoint_every: int,
         checkpoint_dir: Path | None,
@@ -1052,7 +1070,6 @@ def test_train_command_defaults_checkpoint_every_to_eval_steps(
         ood_route_weight: float,
         ood_route_logit_bias: float,
         route_logit_bias_anneal_steps: int,
-        router_learning_rate_multiplier: float,
         seed: int,
         overwrite: bool,
         **kwargs: object,

@@ -25,8 +25,6 @@ scripts/mini-moe-train.sh 0 \
   --train-expert-0 \
   --train-expert-1 \
   --train-embedding-lmhead \
-  --router-learning-rate-multiplier 20 \
   --weight-diff-every 5 \
   --eval-every 50 \
   --eval-max-batches 32
-
