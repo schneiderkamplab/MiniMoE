@@ -24,7 +24,6 @@ scripts/odin-moe-train.sh 1 \
   --ood-route-weight 0.10 \
   --ood-route-logit-bias 2.0 \
   --route-logit-bias-anneal-steps 25000 \
-  --router-learning-rate-multiplier 100 \
   --weight-diff-every 1 \
   --eval-every 100 \
   --eval-max-batches 32

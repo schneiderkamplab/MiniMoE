@@ -673,6 +673,9 @@ def test_build_training_dry_run_report_lists_trainable_parameters(
     assert "model.layers.0.experts.gate_up_proj" in report.trainable_parameter_names
     assert any(group["weight_decay"] == 0.0 for group in report.optimizer_groups)
     assert any(group["weight_decay"] == 0.1 for group in report.optimizer_groups)
+    router_groups = [group for group in report.optimizer_groups if group["lr_group"] == "router"]
+    assert len(router_groups) == 1
+    assert router_groups[0]["learning_rate"] == pytest.approx(1e-3)
 
 
 def test_build_training_dry_run_report_requires_checkpoint_dir_for_periodic_saves(
@@ -874,7 +877,9 @@ def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: 
         ood_route_logit_bias=1.25,
         route_logit_bias_anneal_steps=750,
         route_logit_bias_anneal_loss_threshold=5e-2,
-        router_learning_rate_multiplier=1.0,
+        router_learning_rate=1e-3,
+        router_lr_anneal_steps=100,
+        router_min_learning_rate=1e-6,
         parameter_selection=TrainingParameterSelection(
             shared=True,
             expert_0=True,

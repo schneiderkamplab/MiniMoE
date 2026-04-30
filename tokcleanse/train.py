@@ -29,6 +29,9 @@ DEFAULT_TRAIN_TORCH_COMPILE: bool | None = None
 DEFAULT_TRAIN_LEARNING_RATE = 5e-5
 DEFAULT_TRAIN_LR_WARMUP_STEPS = 0
 MIN_TRAIN_LEARNING_RATE = 1e-8
+DEFAULT_ROUTER_LEARNING_RATE = 1e-3
+DEFAULT_ROUTER_LR_ANNEAL_STEPS = 100
+DEFAULT_ROUTER_MIN_LEARNING_RATE = 1e-6
 DEFAULT_TRAIN_EVAL_EVERY = 50
 DEFAULT_TRAIN_EVAL_MAX_BATCHES = 32
 DEFAULT_LOG_EVERY = 1
@@ -38,7 +41,7 @@ _DISTILL_KL_VOCAB_CHUNK_SIZE = 4096
 DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE = 0
 _TOKENIZER_TOKEN_GROUPS_FILENAME = "tokenizer_token_groups.json"
 _TRAINING_STATE_FILENAME = "training_state.pt"
-_TRAINING_STATE_VERSION = 2
+_TRAINING_STATE_VERSION = 3
 _AUXILIARY_TOKENIZER_FILENAMES = (
     "tokenizer_mapping.json",
     "tokenizer_token_groups.json",
@@ -115,7 +118,9 @@ class TrainingDryRunReport:
     ood_route_logit_bias: float
     route_logit_bias_anneal_steps: int
     route_logit_bias_anneal_loss_threshold: float
-    router_learning_rate_multiplier: float
+    router_learning_rate: float
+    router_lr_anneal_steps: int
+    router_min_learning_rate: float
     train_shared: bool
     train_expert_0: bool
     train_expert_1: bool
@@ -149,6 +154,7 @@ class _RouterRoutingMetrics:
 @dataclass(slots=True)
 class _LearningRateScheduler:
     optimizer: Any
+    lr_group: str
     warmup_steps: int
     total_steps: int
     min_learning_rate: float
@@ -171,6 +177,7 @@ class _LearningRateScheduler:
     def state_dict(self) -> dict[str, int | float]:
         return {
             "completed_steps": self.completed_steps,
+            "lr_group": self.lr_group,
             "warmup_steps": self.warmup_steps,
             "total_steps": self.total_steps,
             "min_learning_rate": self.min_learning_rate,
@@ -182,6 +189,7 @@ class _LearningRateScheduler:
         if not isinstance(completed_steps, int) or completed_steps < 0:
             raise ValueError("training-state lr_scheduler completed_steps must be a non-negative integer")
         expected_values = {
+            "lr_group": self.lr_group,
             "warmup_steps": self.warmup_steps,
             "total_steps": self.total_steps,
             "min_learning_rate": self.min_learning_rate,
@@ -197,7 +205,8 @@ class _LearningRateScheduler:
     def _apply_learning_rate(self) -> None:
         learning_rate = self._current_learning_rate()
         for group in self.optimizer.param_groups:
-            group["lr"] = learning_rate * float(group.get("lr_scale", 1.0))
+            if group.get("lr_group", "main") == self.lr_group:
+                group["lr"] = learning_rate
 
     def _current_learning_rate(self) -> float:
         step_index = self.completed_steps + 1
@@ -466,7 +475,9 @@ def build_training_dry_run_report(
     ood_route_logit_bias: float = 0.0,
     route_logit_bias_anneal_steps: int = 0,
     route_logit_bias_anneal_loss_threshold: float = 5e-2,
-    router_learning_rate_multiplier: float = 1.0,
+    router_learning_rate: float = DEFAULT_ROUTER_LEARNING_RATE,
+    router_lr_anneal_steps: int = DEFAULT_ROUTER_LR_ANNEAL_STEPS,
+    router_min_learning_rate: float = DEFAULT_ROUTER_MIN_LEARNING_RATE,
     train_shared: bool = False,
     train_expert_0: bool = False,
     train_expert_1: bool = True,
@@ -500,8 +511,12 @@ def build_training_dry_run_report(
         raise ValueError("--route-logit-bias-anneal-steps cannot be negative")
     if route_logit_bias_anneal_loss_threshold < 0:
         raise ValueError("--route-logit-bias-anneal-loss-threshold cannot be negative")
-    if router_learning_rate_multiplier <= 0:
-        raise ValueError("--router-learning-rate-multiplier must be positive")
+    if router_learning_rate <= 0:
+        raise ValueError("--router-learning-rate must be positive")
+    if router_lr_anneal_steps < 1:
+        raise ValueError("--router-lr-anneal-steps must be at least 1")
+    if router_min_learning_rate <= 0:
+        raise ValueError("--router-min-learning-rate must be positive")
     if distill_kl_vocab_chunk_size < 0:
         raise ValueError("--distill-kl-vocab-chunk-size cannot be negative")
     if checkpoint_every < 0:
@@ -588,7 +603,8 @@ def build_training_dry_run_report(
             masked_row_parameters=masked_row_parameters,
             named_parameters=dict(model.named_parameters()),
             weight_decay=weight_decay,
-            router_learning_rate_multiplier=router_learning_rate_multiplier,
+            learning_rate=learning_rate,
+            router_learning_rate=router_learning_rate,
         )
         return TrainingDryRunReport(
             resolved_device=resolved_device,
@@ -619,8 +635,10 @@ def build_training_dry_run_report(
             ood_route_logit_bias=ood_route_logit_bias,
             route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
             route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
+            router_learning_rate=router_learning_rate,
+            router_lr_anneal_steps=router_lr_anneal_steps,
+            router_min_learning_rate=router_min_learning_rate,
             distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
-            router_learning_rate_multiplier=router_learning_rate_multiplier,
             train_shared=train_shared,
             train_expert_0=train_expert_0,
             train_expert_1=train_expert_1,
@@ -687,7 +705,9 @@ def train_distilled_model(
     ood_route_logit_bias: float = 0.0,
     route_logit_bias_anneal_steps: int = 0,
     route_logit_bias_anneal_loss_threshold: float = 5e-2,
-    router_learning_rate_multiplier: float = 1.0,
+    router_learning_rate: float = DEFAULT_ROUTER_LEARNING_RATE,
+    router_lr_anneal_steps: int = DEFAULT_ROUTER_LR_ANNEAL_STEPS,
+    router_min_learning_rate: float = DEFAULT_ROUTER_MIN_LEARNING_RATE,
     train_shared: bool = False,
     train_expert_0: bool = False,
     train_expert_1: bool = True,
@@ -727,8 +747,12 @@ def train_distilled_model(
         raise ValueError("--route-logit-bias-anneal-steps cannot be negative")
     if route_logit_bias_anneal_loss_threshold < 0:
         raise ValueError("--route-logit-bias-anneal-loss-threshold cannot be negative")
-    if router_learning_rate_multiplier <= 0:
-        raise ValueError("--router-learning-rate-multiplier must be positive")
+    if router_learning_rate <= 0:
+        raise ValueError("--router-learning-rate must be positive")
+    if router_lr_anneal_steps < 1:
+        raise ValueError("--router-lr-anneal-steps must be at least 1")
+    if router_min_learning_rate <= 0:
+        raise ValueError("--router-min-learning-rate must be positive")
     if distill_kl_vocab_chunk_size < 0:
         raise ValueError("--distill-kl-vocab-chunk-size cannot be negative")
     if checkpoint_every < 0:
@@ -848,7 +872,9 @@ def train_distilled_model(
         ood_route_logit_bias=ood_route_logit_bias,
         route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
         route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
-        router_learning_rate_multiplier=router_learning_rate_multiplier,
+        router_learning_rate=router_learning_rate,
+        router_lr_anneal_steps=router_lr_anneal_steps,
+        router_min_learning_rate=router_min_learning_rate,
         parameter_selection=parameter_selection,
         seed=seed,
     )
@@ -944,7 +970,8 @@ def train_distilled_model(
             router_trainable_parameters=router_trainable_parameters,
             masked_row_parameters=masked_row_parameters,
             weight_decay=weight_decay,
-            router_learning_rate_multiplier=router_learning_rate_multiplier,
+            learning_rate=learning_rate,
+            router_learning_rate=router_learning_rate,
         )
         optimizer = torch.optim.AdamW(
             optimizer_param_groups,
@@ -955,18 +982,34 @@ def train_distilled_model(
         )
         lr_scheduler = _build_learning_rate_scheduler(
             optimizer=optimizer,
+            lr_group="main",
             warmup_steps=lr_warmup_steps,
             total_steps=resolved_steps,
             min_learning_rate=MIN_TRAIN_LEARNING_RATE,
             base_learning_rate=learning_rate,
             torch_module=torch,
         )
+        router_lr_scheduler = None
+        if router_trainable_parameters:
+            router_lr_scheduler = _build_learning_rate_scheduler(
+                optimizer=optimizer,
+                lr_group="router",
+                warmup_steps=0,
+                total_steps=router_lr_anneal_steps,
+                min_learning_rate=router_min_learning_rate,
+                base_learning_rate=router_learning_rate,
+                torch_module=torch,
+            )
         _restore_resume_state(
             resume_state=resume_state,
             optimizer=optimizer,
             optimizer_weight_decays=optimizer_weight_decays,
-            learning_rate=learning_rate,
+            learning_rates_by_group={
+                "main": learning_rate,
+                "router": router_learning_rate,
+            },
             lr_scheduler=lr_scheduler,
+            router_lr_scheduler=router_lr_scheduler,
             ind_stream=ind_stream,
             ood_stream=ood_stream,
             scheduler=scheduler,
@@ -1175,6 +1218,8 @@ def train_distilled_model(
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
+            if router_lr_scheduler is not None:
+                router_lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             _release_mps_working_set(
                 torch_module=torch,
@@ -1197,6 +1242,12 @@ def train_distilled_model(
                 "ood": _format_optional_metric(ood_loss),
                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
             }
+            current_router_learning_rate = _optimizer_group_learning_rate(
+                optimizer=optimizer,
+                lr_group="router",
+            )
+            if current_router_learning_rate is not None:
+                postfix["rlr"] = f"{current_router_learning_rate:.2e}"
             if route_logit_bias_anneal_steps > 0:
                 postfix["bias"] = f"{route_logit_bias_scale:.3f}"
                 postfix["bias_n"] = str(route_bias_annealer.completed_anneal_steps)
@@ -1249,6 +1300,7 @@ def train_distilled_model(
                 "train_distill_loss": step_metrics["distill_loss"] / gradient_accumulation_steps,
                 "train_route_loss": average_route_loss,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "router_learning_rate": current_router_learning_rate,
                 "ind_train_loss": ind_loss,
                 "ind_train_task_loss": _average_language_metric(language_metrics["ind"], "task_loss"),
                 "ind_train_lm_loss": _average_language_metric(language_metrics["ind"], "lm_loss"),
@@ -1292,6 +1344,7 @@ def train_distilled_model(
                     step_label=f"step {step}",
                     optimizer=optimizer,
                     lr_scheduler=lr_scheduler,
+                    router_lr_scheduler=router_lr_scheduler,
                     ind_stream=ind_stream,
                     ood_stream=ood_stream,
                     scheduler=scheduler,
@@ -1309,6 +1362,7 @@ def train_distilled_model(
             checkpoint_path=output_path,
             optimizer=optimizer,
             lr_scheduler=lr_scheduler,
+            router_lr_scheduler=router_lr_scheduler,
             ind_stream=ind_stream,
             ood_stream=ood_stream,
             scheduler=scheduler,
@@ -1327,6 +1381,7 @@ def train_distilled_model(
                 step_label="final",
                 optimizer=optimizer,
                 lr_scheduler=lr_scheduler,
+                router_lr_scheduler=router_lr_scheduler,
                 ind_stream=ind_stream,
                 ood_stream=ood_stream,
                 scheduler=scheduler,
@@ -1367,7 +1422,9 @@ def train_distilled_model(
             ood_route_logit_bias=ood_route_logit_bias,
             route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
             route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
-            router_learning_rate_multiplier=router_learning_rate_multiplier,
+            router_learning_rate=router_learning_rate,
+            router_lr_anneal_steps=router_lr_anneal_steps,
+            router_min_learning_rate=router_min_learning_rate,
             parameter_selection=parameter_selection,
             distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
             checkpoint_every=checkpoint_every,
@@ -1813,7 +1870,8 @@ def _build_optimizer_param_groups(
     router_trainable_parameters: list[Any],
     masked_row_parameters: list[Any],
     weight_decay: float,
-    router_learning_rate_multiplier: float,
+    learning_rate: float,
+    router_learning_rate: float,
 ) -> list[dict[str, Any]]:
     optimizer_param_groups: list[dict[str, Any]] = []
     if standard_trainable_parameters:
@@ -1821,7 +1879,8 @@ def _build_optimizer_param_groups(
             {
                 "params": standard_trainable_parameters,
                 "weight_decay": weight_decay,
-                "lr_scale": 1.0,
+                "lr": learning_rate,
+                "lr_group": "main",
             }
         )
     if router_trainable_parameters:
@@ -1829,7 +1888,8 @@ def _build_optimizer_param_groups(
             {
                 "params": router_trainable_parameters,
                 "weight_decay": weight_decay,
-                "lr_scale": router_learning_rate_multiplier,
+                "lr": router_learning_rate,
+                "lr_group": "router",
             }
         )
     if masked_row_parameters:
@@ -1839,7 +1899,8 @@ def _build_optimizer_param_groups(
             {
                 "params": masked_row_parameters,
                 "weight_decay": 0.0,
-                "lr_scale": 1.0,
+                "lr": learning_rate,
+                "lr_group": "main",
             }
         )
     return optimizer_param_groups
@@ -1852,7 +1913,8 @@ def _serialize_optimizer_groups(
     masked_row_parameters: list[Any],
     named_parameters: dict[str, Any],
     weight_decay: float,
-    router_learning_rate_multiplier: float,
+    learning_rate: float,
+    router_learning_rate: float,
 ) -> tuple[dict[str, Any], ...]:
     parameter_name_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
     groups = _build_optimizer_param_groups(
@@ -1860,14 +1922,16 @@ def _serialize_optimizer_groups(
         router_trainable_parameters=router_trainable_parameters,
         masked_row_parameters=masked_row_parameters,
         weight_decay=weight_decay,
-        router_learning_rate_multiplier=router_learning_rate_multiplier,
+        learning_rate=learning_rate,
+        router_learning_rate=router_learning_rate,
     )
     serialized_groups = []
     for group in groups:
         serialized_groups.append(
             {
                 "weight_decay": group["weight_decay"],
-                "lr_scale": group.get("lr_scale", 1.0),
+                "learning_rate": group["lr"],
+                "lr_group": group["lr_group"],
                 "parameter_names": sorted(
                     parameter_name_by_id[id(parameter)]
                     for parameter in group["params"]
@@ -1875,6 +1939,13 @@ def _serialize_optimizer_groups(
             }
         )
     return tuple(serialized_groups)
+
+
+def _optimizer_group_learning_rate(*, optimizer: Any, lr_group: str) -> float | None:
+    for group in optimizer.param_groups:
+        if group.get("lr_group") == lr_group:
+            return float(group["lr"])
+    return None
 
 
 def _build_row_mask(
@@ -2024,6 +2095,7 @@ def _compile_model_for_runtime(*, model: Any, enabled: bool, torch_module: Any) 
 def _build_learning_rate_scheduler(
     *,
     optimizer: Any,
+    lr_group: str = "main",
     warmup_steps: int,
     total_steps: int,
     min_learning_rate: float,
@@ -2034,6 +2106,7 @@ def _build_learning_rate_scheduler(
         return None
     return _LearningRateScheduler(
         optimizer=optimizer,
+        lr_group=lr_group,
         warmup_steps=warmup_steps,
         total_steps=total_steps,
         min_learning_rate=min_learning_rate,
@@ -2266,8 +2339,9 @@ def _restore_resume_state(
     resume_state: dict[str, Any] | None,
     optimizer: Any,
     optimizer_weight_decays: tuple[float, ...],
-    learning_rate: float,
+    learning_rates_by_group: dict[str, float],
     lr_scheduler: _LearningRateScheduler | None,
+    router_lr_scheduler: _LearningRateScheduler | None,
     ind_stream: _CorpusStream | None,
     ood_stream: _CorpusStream | None,
     scheduler: _LanguageScheduler,
@@ -2283,13 +2357,18 @@ def _restore_resume_state(
     _reapply_optimizer_hyperparameters(
         optimizer=optimizer,
         optimizer_weight_decays=optimizer_weight_decays,
-        learning_rate=learning_rate,
+        learning_rates_by_group=learning_rates_by_group,
     )
     if lr_scheduler is not None:
         scheduler_state = resume_state.get("lr_scheduler_state_dict")
         if not isinstance(scheduler_state, dict):
             raise ValueError("training-state lr_scheduler_state_dict is missing")
         lr_scheduler.load_state_dict(scheduler_state)
+    if router_lr_scheduler is not None:
+        router_scheduler_state = resume_state.get("router_lr_scheduler_state_dict")
+        if not isinstance(router_scheduler_state, dict):
+            raise ValueError("training-state router_lr_scheduler_state_dict is missing")
+        router_lr_scheduler.load_state_dict(router_scheduler_state)
     if ind_stream is not None:
         ind_stream_state = resume_state.get("ind_stream_state_dict")
         if not isinstance(ind_stream_state, dict):
@@ -2436,7 +2515,9 @@ def _build_training_configuration_state(
     ood_route_logit_bias: float,
     route_logit_bias_anneal_steps: int,
     route_logit_bias_anneal_loss_threshold: float,
-    router_learning_rate_multiplier: float,
+    router_learning_rate: float,
+    router_lr_anneal_steps: int,
+    router_min_learning_rate: float,
     parameter_selection: TrainingParameterSelection,
     seed: int,
 ) -> dict[str, Any]:
@@ -2489,7 +2570,9 @@ def _build_training_configuration_state(
         "ood_route_logit_bias": ood_route_logit_bias,
         "route_logit_bias_anneal_steps": route_logit_bias_anneal_steps,
         "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
-        "router_learning_rate_multiplier": router_learning_rate_multiplier,
+        "router_learning_rate": router_learning_rate,
+        "router_lr_anneal_steps": router_lr_anneal_steps,
+        "router_min_learning_rate": router_min_learning_rate,
         "parameter_selection": asdict(parameter_selection),
         "seed": seed,
     }
@@ -2524,12 +2607,15 @@ def _reapply_optimizer_hyperparameters(
     *,
     optimizer: Any,
     optimizer_weight_decays: tuple[float, ...],
-    learning_rate: float,
+    learning_rates_by_group: dict[str, float],
 ) -> None:
     if len(optimizer.param_groups) != len(optimizer_weight_decays):
         raise ValueError("optimizer state is incompatible with current parameter groups")
     for group, weight_decay in zip(optimizer.param_groups, optimizer_weight_decays, strict=True):
-        group["lr"] = learning_rate
+        lr_group = group.get("lr_group")
+        if not isinstance(lr_group, str) or lr_group not in learning_rates_by_group:
+            raise ValueError("optimizer state is incompatible with current learning-rate groups")
+        group["lr"] = learning_rates_by_group[lr_group]
         group["weight_decay"] = weight_decay
 
 
@@ -2562,6 +2648,7 @@ def _save_training_checkpoint(
     step_label: str,
     optimizer: Any,
     lr_scheduler: _LearningRateScheduler | None,
+    router_lr_scheduler: _LearningRateScheduler | None,
     ind_stream: _CorpusStream | None,
     ood_stream: _CorpusStream | None,
     scheduler: _LanguageScheduler,
@@ -2582,6 +2669,7 @@ def _save_training_checkpoint(
         checkpoint_path=checkpoint_path,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
+        router_lr_scheduler=router_lr_scheduler,
         ind_stream=ind_stream,
         ood_stream=ood_stream,
         scheduler=scheduler,
@@ -2598,6 +2686,7 @@ def _save_training_state(
     checkpoint_path: Path,
     optimizer: Any,
     lr_scheduler: _LearningRateScheduler | None,
+    router_lr_scheduler: _LearningRateScheduler | None,
     ind_stream: _CorpusStream | None,
     ood_stream: _CorpusStream | None,
     scheduler: _LanguageScheduler,
@@ -2614,6 +2703,9 @@ def _save_training_state(
         "training_configuration": training_configuration_state,
         "optimizer_state_dict": optimizer.state_dict(),
         "lr_scheduler_state_dict": None if lr_scheduler is None else lr_scheduler.state_dict(),
+        "router_lr_scheduler_state_dict": (
+            None if router_lr_scheduler is None else router_lr_scheduler.state_dict()
+        ),
         "ind_stream_state_dict": None if ind_stream is None else ind_stream.state_dict(),
         "ood_stream_state_dict": None if ood_stream is None else ood_stream.state_dict(),
         "language_scheduler_state_dict": scheduler.state_dict(),
@@ -2661,7 +2753,9 @@ def _write_training_recipe(
     ood_route_logit_bias: float,
     route_logit_bias_anneal_steps: int,
     route_logit_bias_anneal_loss_threshold: float,
-    router_learning_rate_multiplier: float,
+    router_learning_rate: float,
+    router_lr_anneal_steps: int,
+    router_min_learning_rate: float,
     parameter_selection: TrainingParameterSelection,
     distill_kl_vocab_chunk_size: int,
     checkpoint_every: int,
@@ -2714,7 +2808,9 @@ def _write_training_recipe(
         "ood_route_logit_bias": ood_route_logit_bias,
         "route_logit_bias_anneal_steps": route_logit_bias_anneal_steps,
         "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
-        "router_learning_rate_multiplier": router_learning_rate_multiplier,
+        "router_learning_rate": router_learning_rate,
+        "router_lr_anneal_steps": router_lr_anneal_steps,
+        "router_min_learning_rate": router_min_learning_rate,
         "parameter_selection": asdict(parameter_selection),
         "distill_kl_vocab_chunk_size": distill_kl_vocab_chunk_size,
         "checkpoint_every": checkpoint_every,
@@ -2925,6 +3021,9 @@ def _print_training_metrics(record: dict[str, Any]) -> None:
     learning_rate = record.get("learning_rate")
     if isinstance(learning_rate, float):
         parts.insert(5, f"lr={learning_rate:.2e}")
+    router_learning_rate = record.get("router_learning_rate")
+    if isinstance(router_learning_rate, float):
+        parts.insert(6, f"router_lr={router_learning_rate:.2e}")
     step_total_s = record.get("step_total_s")
     if isinstance(step_total_s, float):
         parts.append(f"step_s={_format_optional_seconds(step_total_s)}")
