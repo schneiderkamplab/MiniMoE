@@ -38,6 +38,7 @@ _DISTILL_KL_VOCAB_CHUNK_SIZE = 4096
 DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE = 0
 _TOKENIZER_TOKEN_GROUPS_FILENAME = "tokenizer_token_groups.json"
 _TRAINING_STATE_FILENAME = "training_state.pt"
+_TRAINING_STATE_VERSION = 2
 _AUXILIARY_TOKENIZER_FILENAMES = (
     "tokenizer_mapping.json",
     "tokenizer_token_groups.json",
@@ -72,6 +73,17 @@ class TrainingLossWeights:
 
 
 @dataclass(frozen=True, slots=True)
+class TrainingParameterSelection:
+    """Parameter groups selected for training."""
+
+    shared: bool = False
+    expert_0: bool = False
+    expert_1: bool = True
+    embedding_lm_head: bool = True
+    full_embedding_lm_head: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class TrainingDryRunReport:
     """Inspectable summary of what the trainer would optimize."""
 
@@ -102,7 +114,13 @@ class TrainingDryRunReport:
     ood_route_weight: float
     ood_route_logit_bias: float
     route_logit_bias_anneal_steps: int
+    route_logit_bias_anneal_loss_threshold: float
     router_learning_rate_multiplier: float
+    train_shared: bool
+    train_expert_0: bool
+    train_expert_1: bool
+    train_embedding_lm_head: bool
+    train_full_embedding_lm_head: bool
     distill_kl_vocab_chunk_size: int
     checkpoint_every: int
     checkpoint_dir: str | None
@@ -150,13 +168,29 @@ class _LearningRateScheduler:
         self.completed_steps += 1
         self._apply_learning_rate()
 
-    def state_dict(self) -> dict[str, int]:
-        return {"completed_steps": self.completed_steps}
+    def state_dict(self) -> dict[str, int | float]:
+        return {
+            "completed_steps": self.completed_steps,
+            "warmup_steps": self.warmup_steps,
+            "total_steps": self.total_steps,
+            "min_learning_rate": self.min_learning_rate,
+            "base_learning_rate": self.base_learning_rate,
+        }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         completed_steps = state_dict.get("completed_steps", 0)
         if not isinstance(completed_steps, int) or completed_steps < 0:
             raise ValueError("training-state lr_scheduler completed_steps must be a non-negative integer")
+        expected_values = {
+            "warmup_steps": self.warmup_steps,
+            "total_steps": self.total_steps,
+            "min_learning_rate": self.min_learning_rate,
+            "base_learning_rate": self.base_learning_rate,
+        }
+        for key, expected_value in expected_values.items():
+            saved_value = state_dict.get(key, expected_value)
+            if saved_value != expected_value:
+                raise ValueError(f"training-state lr_scheduler {key} does not match current run")
         self.completed_steps = completed_steps
         self._apply_learning_rate()
 
@@ -175,6 +209,54 @@ class _LearningRateScheduler:
         cosine_scale = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
         min_ratio = min(self.min_learning_rate / self.base_learning_rate, 1.0)
         return self.base_learning_rate * (min_ratio + (1.0 - min_ratio) * cosine_scale)
+
+
+@dataclass(slots=True)
+class _RouteBiasAnnealer:
+    anneal_steps: int
+    loss_threshold: float
+    completed_anneal_steps: int = 0
+
+    def __post_init__(self) -> None:
+        if self.anneal_steps < 0:
+            raise ValueError("anneal_steps cannot be negative")
+        if self.loss_threshold < 0:
+            raise ValueError("loss_threshold cannot be negative")
+
+    def scale(self) -> float:
+        if self.anneal_steps <= 0:
+            return 1.0
+        if self.anneal_steps <= 1 or self.completed_anneal_steps >= self.anneal_steps - 1:
+            return 0.0
+        progress = self.completed_anneal_steps / (self.anneal_steps - 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def observe_route_loss(self, route_loss: float) -> bool:
+        if self.anneal_steps <= 0:
+            return False
+        if math.isfinite(route_loss) and route_loss <= self.loss_threshold:
+            self.completed_anneal_steps = min(self.completed_anneal_steps + 1, self.anneal_steps)
+            return True
+        return False
+
+    def state_dict(self) -> dict[str, int | float]:
+        return {
+            "anneal_steps": self.anneal_steps,
+            "loss_threshold": self.loss_threshold,
+            "completed_anneal_steps": self.completed_anneal_steps,
+        }
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        anneal_steps = state_dict.get("anneal_steps", self.anneal_steps)
+        loss_threshold = state_dict.get("loss_threshold", self.loss_threshold)
+        if anneal_steps != self.anneal_steps:
+            raise ValueError("training-state route_bias_annealer anneal_steps does not match current run")
+        if loss_threshold != self.loss_threshold:
+            raise ValueError("training-state route_bias_annealer loss_threshold does not match current run")
+        completed_anneal_steps = state_dict.get("completed_anneal_steps", 0)
+        if not isinstance(completed_anneal_steps, int) or completed_anneal_steps < 0:
+            raise ValueError("training-state route_bias_annealer completed_anneal_steps is invalid")
+        self.completed_anneal_steps = min(completed_anneal_steps, max(self.anneal_steps, 0))
 
 
 def load_token_group_metadata(model_path: str | Path) -> TokenGroupMetadata:
@@ -212,22 +294,40 @@ def prepare_student_for_distillation(
     *,
     token_groups: TokenGroupMetadata,
     torch_module: Any,
+    parameter_selection: TrainingParameterSelection = TrainingParameterSelection(),
 ) -> None:
     """Freeze the shared backbone and leave MoE-specific plus added rows trainable."""
 
+    masked_row_parameter_ids = _masked_row_parameter_ids(model)
     for _, parameter in model.named_parameters():
         parameter.requires_grad_(False)
 
     for name, parameter in model.named_parameters():
-        if _is_moe_trainable_parameter(name):
+        if id(parameter) in masked_row_parameter_ids:
+            continue
+        if _is_expert_weight_parameter(name):
+            if parameter_selection.expert_0 or parameter_selection.expert_1:
+                parameter.requires_grad_(True)
+                _mask_frozen_expert_gradients(
+                    name=name,
+                    parameter=parameter,
+                    torch_module=torch_module,
+                    train_expert_0=parameter_selection.expert_0,
+                    train_expert_1=parameter_selection.expert_1,
+                )
+        elif _is_router_parameter(name):
             parameter.requires_grad_(True)
-            _mask_frozen_expert_gradients(name=name, parameter=parameter, torch_module=torch_module)
+        elif parameter_selection.shared:
+            parameter.requires_grad_(True)
 
-    _enable_added_token_rows(
-        model=model,
-        token_ids=token_groups.added_token_ids,
-        torch_module=torch_module,
-    )
+    if parameter_selection.embedding_lm_head and parameter_selection.full_embedding_lm_head:
+        _enable_all_embedding_lm_head(model=model)
+    elif parameter_selection.embedding_lm_head:
+        _enable_added_token_rows(
+            model=model,
+            token_ids=token_groups.added_token_ids,
+            torch_module=torch_module,
+        )
 
 
 class _RouterRoutingMetricCollector:
@@ -365,7 +465,13 @@ def build_training_dry_run_report(
     ood_route_weight: float = 0.0,
     ood_route_logit_bias: float = 0.0,
     route_logit_bias_anneal_steps: int = 0,
+    route_logit_bias_anneal_loss_threshold: float = 5e-2,
     router_learning_rate_multiplier: float = 1.0,
+    train_shared: bool = False,
+    train_expert_0: bool = False,
+    train_expert_1: bool = True,
+    train_embedding_lm_head: bool = True,
+    train_full_embedding_lm_head: bool = False,
 ) -> TrainingDryRunReport:
     """Describe which parameters and rows would be trained without running training."""
 
@@ -392,6 +498,8 @@ def build_training_dry_run_report(
         raise ValueError("--ind-route-weight and --ood-route-weight cannot be negative")
     if route_logit_bias_anneal_steps < 0:
         raise ValueError("--route-logit-bias-anneal-steps cannot be negative")
+    if route_logit_bias_anneal_loss_threshold < 0:
+        raise ValueError("--route-logit-bias-anneal-loss-threshold cannot be negative")
     if router_learning_rate_multiplier <= 0:
         raise ValueError("--router-learning-rate-multiplier must be positive")
     if distill_kl_vocab_chunk_size < 0:
@@ -404,6 +512,13 @@ def build_training_dry_run_report(
         raise ValueError("--ind-batches-per-cycle and --ood-batches-per-cycle cannot be negative")
     if not ind_files and not ood_files:
         raise ValueError("At least one corpus file must be provided")
+    parameter_selection = TrainingParameterSelection(
+        shared=train_shared,
+        expert_0=train_expert_0,
+        expert_1=train_expert_1,
+        embedding_lm_head=train_embedding_lm_head,
+        full_embedding_lm_head=train_full_embedding_lm_head,
+    )
 
     scheduler = _LanguageScheduler(
         ind_enabled=bool(ind_files),
@@ -448,6 +563,7 @@ def build_training_dry_run_report(
             model,
             token_groups=token_groups,
             torch_module=torch,
+            parameter_selection=parameter_selection,
         )
         masked_row_parameter_ids = _masked_row_parameter_ids(model)
         masked_row_parameter_names: list[str] = []
@@ -502,8 +618,14 @@ def build_training_dry_run_report(
             ood_route_weight=ood_route_weight,
             ood_route_logit_bias=ood_route_logit_bias,
             route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
+            route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
             distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
             router_learning_rate_multiplier=router_learning_rate_multiplier,
+            train_shared=train_shared,
+            train_expert_0=train_expert_0,
+            train_expert_1=train_expert_1,
+            train_embedding_lm_head=train_embedding_lm_head,
+            train_full_embedding_lm_head=train_full_embedding_lm_head,
             checkpoint_every=checkpoint_every,
             checkpoint_dir=str(checkpoint_dir.expanduser()) if checkpoint_dir is not None else None,
             masked_row_parameter_names=tuple(masked_row_parameter_names),
@@ -564,13 +686,21 @@ def train_distilled_model(
     ood_route_weight: float = 0.0,
     ood_route_logit_bias: float = 0.0,
     route_logit_bias_anneal_steps: int = 0,
+    route_logit_bias_anneal_loss_threshold: float = 5e-2,
     router_learning_rate_multiplier: float = 1.0,
+    train_shared: bool = False,
+    train_expert_0: bool = False,
+    train_expert_1: bool = True,
+    train_embedding_lm_head: bool = True,
+    train_full_embedding_lm_head: bool = False,
     seed: int = 0,
     overwrite: bool = False,
 ) -> Path:
     """Train an upcycled student model against a frozen teacher with aligned tokenizers."""
 
     import torch
+
+    _seed_training_random_generators(seed=seed, torch_module=torch)
     if steps == 0:
         raise ValueError("--steps must not be 0")
     if batch_size < 1:
@@ -595,6 +725,8 @@ def train_distilled_model(
         raise ValueError("--ind-route-weight and --ood-route-weight cannot be negative")
     if route_logit_bias_anneal_steps < 0:
         raise ValueError("--route-logit-bias-anneal-steps cannot be negative")
+    if route_logit_bias_anneal_loss_threshold < 0:
+        raise ValueError("--route-logit-bias-anneal-loss-threshold cannot be negative")
     if router_learning_rate_multiplier <= 0:
         raise ValueError("--router-learning-rate-multiplier must be positive")
     if distill_kl_vocab_chunk_size < 0:
@@ -611,6 +743,13 @@ def train_distilled_model(
         raise ValueError("--ind-batches-per-cycle and --ood-batches-per-cycle cannot be negative")
     if not ind_files and not ood_files:
         raise ValueError("At least one corpus file must be provided")
+    parameter_selection = TrainingParameterSelection(
+        shared=train_shared,
+        expert_0=train_expert_0,
+        expert_1=train_expert_1,
+        embedding_lm_head=train_embedding_lm_head,
+        full_embedding_lm_head=train_full_embedding_lm_head,
+    )
 
     rng = random.Random(seed)
     needs_teacher = (
@@ -666,6 +805,57 @@ def train_distilled_model(
     )
     output_path = Path(output_dir).expanduser()
     resume_step = _resume_state_step(resume_state) or 0
+    training_configuration_state = _build_training_configuration_state(
+        resolved_steps=resolved_steps,
+        resolved_epochs=resolved_epochs,
+        teacher_model=teacher_model,
+        ind_files=ind_files,
+        ood_files=ood_files,
+        eval_files=eval_files,
+        resolved_device=resolved_device,
+        dtype=dtype,
+        batch_size=batch_size,
+        eval_batch_size=resolved_eval_batch_size,
+        eval_max_batches=eval_max_batches,
+        weight_diff_every=weight_diff_every,
+        pad_to_max_length=pad_to_max_length,
+        torch_compile=resolved_torch_compile,
+        distill_ind=distill_ind,
+        distill_ood=distill_ood,
+        distill_original_tokens_only=distill_original_tokens_only,
+        distill_every=distill_every,
+        lr_warmup_steps=lr_warmup_steps,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
+        max_length=max_length,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
+        checkpoint_every=checkpoint_every,
+        checkpoint_dir=checkpoint_dir.expanduser() if checkpoint_dir is not None else None,
+        eval_every_steps=eval_every_steps,
+        log_every=log_every,
+        print_every=print_every,
+        ind_batches_per_cycle=ind_batches_per_cycle,
+        ood_batches_per_cycle=ood_batches_per_cycle,
+        ind_lm_weight=ind_lm_weight,
+        ind_distill_weight=ind_distill_weight,
+        ind_route_weight=ind_route_weight,
+        ind_route_logit_bias=ind_route_logit_bias,
+        ood_lm_weight=ood_lm_weight,
+        ood_distill_weight=ood_distill_weight,
+        ood_route_weight=ood_route_weight,
+        ood_route_logit_bias=ood_route_logit_bias,
+        route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
+        route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
+        router_learning_rate_multiplier=router_learning_rate_multiplier,
+        parameter_selection=parameter_selection,
+        seed=seed,
+    )
+    _validate_resume_training_configuration(
+        resume_state=resume_state,
+        training_configuration_state=training_configuration_state,
+    )
     if output_path.exists():
         if not overwrite:
             raise FileExistsError(f"Destination already exists: {output_path}")
@@ -690,6 +880,10 @@ def train_distilled_model(
     metrics_log_path = output_path / "training_metrics.jsonl"
     ind_weights = TrainingLossWeights(lm=ind_lm_weight, distill=ind_distill_weight, route=ind_route_weight)
     ood_weights = TrainingLossWeights(lm=ood_lm_weight, distill=ood_distill_weight, route=ood_route_weight)
+    route_bias_annealer = _RouteBiasAnnealer(
+        anneal_steps=route_logit_bias_anneal_steps,
+        loss_threshold=route_logit_bias_anneal_loss_threshold,
+    )
 
     tokenizer = None
     teacher_tokenizer = None
@@ -726,6 +920,7 @@ def train_distilled_model(
             student,
             token_groups=token_groups,
             torch_module=torch,
+            parameter_selection=parameter_selection,
         )
         student.train()
 
@@ -742,7 +937,7 @@ def train_distilled_model(
                 masked_row_parameters.append(parameter)
             else:
                 standard_trainable_parameters.append(parameter)
-        if not masked_row_parameters and not standard_trainable_parameters:
+        if not masked_row_parameters and not standard_trainable_parameters and not router_trainable_parameters:
             raise ValueError("No trainable parameters were selected for training")
         optimizer_param_groups = _build_optimizer_param_groups(
             standard_trainable_parameters=standard_trainable_parameters,
@@ -775,6 +970,7 @@ def train_distilled_model(
             ind_stream=ind_stream,
             ood_stream=ood_stream,
             scheduler=scheduler,
+            route_bias_annealer=route_bias_annealer,
         )
         optimizer.zero_grad(set_to_none=True)
         student_runtime = _compile_model_for_runtime(
@@ -785,15 +981,16 @@ def train_distilled_model(
         router_metric_collector = _RouterRoutingMetricCollector(torch_module=torch)
         router_metric_collector.register(student)
         student_runtime.train()
+        _restore_training_random_generator_state(
+            resume_state=resume_state,
+            torch_module=torch,
+        )
 
         progress = tqdm(range(resume_step + 1, resolved_steps + 1), desc="Training", unit="step")
-        latest_eval_loss: float | None = None
+        latest_eval_loss = _resume_state_latest_eval_loss(resume_state)
         for step in progress:
             step_started_at = time.perf_counter()
-            route_logit_bias_scale = _route_logit_bias_scale(
-                step=step,
-                anneal_steps=route_logit_bias_anneal_steps,
-            )
+            route_logit_bias_scale = route_bias_annealer.scale()
             effective_ind_route_logit_bias = ind_route_logit_bias * route_logit_bias_scale
             effective_ood_route_logit_bias = ood_route_logit_bias * route_logit_bias_scale
             step_metrics = {
@@ -990,16 +1187,19 @@ def train_distilled_model(
             ind_loss = _average_language_metric(language_metrics["ind"], "loss")
             ood_loss = _average_language_metric(language_metrics["ood"], "loss")
             router_metrics = router_metric_collector.averages() if router_metric_collector is not None else {}
+            average_route_loss = step_metrics["route_loss"] / gradient_accumulation_steps
+            route_logit_bias_annealed = route_bias_annealer.observe_route_loss(average_route_loss)
             postfix = {
                 "mix": mix_label,
                 "loss": f"{step_metrics['loss'] / gradient_accumulation_steps:.4f}",
-                "route": f"{step_metrics['route_loss'] / gradient_accumulation_steps:.4f}",
+                "route": f"{average_route_loss:.4f}",
                 "ind": _format_optional_metric(ind_loss),
                 "ood": _format_optional_metric(ood_loss),
                 "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
             }
             if route_logit_bias_anneal_steps > 0:
                 postfix["bias"] = f"{route_logit_bias_scale:.3f}"
+                postfix["bias_n"] = str(route_bias_annealer.completed_anneal_steps)
             for key, postfix_key in (
                 ("ind_router_weight_expert1", "ind_r1"),
                 ("ood_router_weight_expert1", "ood_r1"),
@@ -1047,7 +1247,7 @@ def train_distilled_model(
                 "train_task_loss": step_metrics["task_loss"] / gradient_accumulation_steps,
                 "train_lm_loss": step_metrics["lm_loss"] / gradient_accumulation_steps,
                 "train_distill_loss": step_metrics["distill_loss"] / gradient_accumulation_steps,
-                "train_route_loss": step_metrics["route_loss"] / gradient_accumulation_steps,
+                "train_route_loss": average_route_loss,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "ind_train_loss": ind_loss,
                 "ind_train_task_loss": _average_language_metric(language_metrics["ind"], "task_loss"),
@@ -1062,6 +1262,9 @@ def train_distilled_model(
                 "eval_lm_loss": current_eval_loss,
                 "latest_eval_lm_loss": latest_eval_loss,
                 "route_logit_bias_scale": route_logit_bias_scale,
+                "route_logit_bias_anneal_progress": route_bias_annealer.completed_anneal_steps,
+                "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
+                "route_logit_bias_annealed": route_logit_bias_annealed,
                 "ind_route_logit_bias": effective_ind_route_logit_bias,
                 "ood_route_logit_bias": effective_ood_route_logit_bias,
                 "step_total_s": step_total_s,
@@ -1092,7 +1295,10 @@ def train_distilled_model(
                     ind_stream=ind_stream,
                     ood_stream=ood_stream,
                     scheduler=scheduler,
+                    route_bias_annealer=route_bias_annealer,
                     step=step,
+                    latest_eval_loss=latest_eval_loss,
+                    training_configuration_state=training_configuration_state,
                     torch_module=torch,
                 )
 
@@ -1106,7 +1312,10 @@ def train_distilled_model(
             ind_stream=ind_stream,
             ood_stream=ood_stream,
             scheduler=scheduler,
+            route_bias_annealer=route_bias_annealer,
             step=resolved_steps,
+            latest_eval_loss=latest_eval_loss,
+            training_configuration_state=training_configuration_state,
             torch_module=torch,
         )
         if checkpointing_enabled and resolved_checkpoint_dir is not None:
@@ -1121,7 +1330,10 @@ def train_distilled_model(
                 ind_stream=ind_stream,
                 ood_stream=ood_stream,
                 scheduler=scheduler,
+                route_bias_annealer=route_bias_annealer,
                 step=resolved_steps,
+                latest_eval_loss=latest_eval_loss,
+                training_configuration_state=training_configuration_state,
                 torch_module=torch,
             )
         _write_training_recipe(
@@ -1154,7 +1366,9 @@ def train_distilled_model(
             ood_route_weight=ood_route_weight,
             ood_route_logit_bias=ood_route_logit_bias,
             route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
+            route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
             router_learning_rate_multiplier=router_learning_rate_multiplier,
+            parameter_selection=parameter_selection,
             distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
             checkpoint_every=checkpoint_every,
             checkpoint_dir=resolved_checkpoint_dir,
@@ -1512,23 +1726,31 @@ def _enable_gradient_checkpointing(model: Any) -> None:
     model.gradient_checkpointing_enable()
 
 
-def _is_moe_trainable_parameter(name: str) -> bool:
-    return any(
-        pattern in name
-        for pattern in (
-            ".experts.",
-            ".router.",
-        )
-    )
+def _is_expert_weight_parameter(name: str) -> bool:
+    return ".experts.gate_up_proj" in name or ".experts.down_proj" in name
 
 
-def _mask_frozen_expert_gradients(*, name: str, parameter: Any, torch_module: Any) -> None:
-    if ".experts.gate_up_proj" not in name and ".experts.down_proj" not in name:
+def _is_router_parameter(name: str) -> bool:
+    return ".router." in name
+
+
+def _mask_frozen_expert_gradients(
+    *,
+    name: str,
+    parameter: Any,
+    torch_module: Any,
+    train_expert_0: bool,
+    train_expert_1: bool,
+) -> None:
+    if not _is_expert_weight_parameter(name):
         return
     if parameter.ndim < 1 or int(parameter.shape[0]) < 2:
         return
     mask = torch_module.zeros_like(parameter)
-    mask[1] = 1
+    if train_expert_0:
+        mask[0] = 1
+    if train_expert_1:
+        mask[1] = 1
     parameter.register_hook(lambda grad, expert_mask=mask: grad * expert_mask.to(dtype=grad.dtype))
 
 
@@ -1559,6 +1781,21 @@ def _enable_added_token_rows(
             device=parameter.device,
         )
         parameter.register_hook(lambda grad, row_mask=mask: grad * row_mask.to(dtype=grad.dtype))
+
+
+def _enable_all_embedding_lm_head(*, model: Any) -> None:
+    handled_parameter_ids: set[int] = set()
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings()
+    for module in (input_embeddings, output_embeddings):
+        if module is None or not hasattr(module, "weight"):
+            continue
+        parameter = module.weight
+        parameter_id = id(parameter)
+        if parameter_id in handled_parameter_ids:
+            continue
+        handled_parameter_ids.add(parameter_id)
+        parameter.requires_grad_(True)
 
 
 def _masked_row_parameter_ids(model: Any) -> frozenset[int]:
@@ -1926,15 +2163,6 @@ def _steps_needed_for_examples(
     return max(1, math.ceil((example_count * epochs) / examples_per_step))
 
 
-def _route_logit_bias_scale(*, step: int, anneal_steps: int) -> float:
-    if anneal_steps <= 0:
-        return 1.0
-    if anneal_steps <= 1 or step >= anneal_steps:
-        return 0.0
-    progress = max(0.0, min(1.0, (step - 1) / (anneal_steps - 1)))
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
 def _count_corpus_examples(paths: tuple[Path, ...]) -> int:
     return _count_corpus_examples_with_progress(
         paths,
@@ -2022,6 +2250,17 @@ def _resume_state_step(resume_state: dict[str, Any] | None) -> int | None:
     return step
 
 
+def _resume_state_latest_eval_loss(resume_state: dict[str, Any] | None) -> float | None:
+    if resume_state is None:
+        return None
+    latest_eval_loss = resume_state.get("latest_eval_loss")
+    if latest_eval_loss is None:
+        return None
+    if not isinstance(latest_eval_loss, (int, float)):
+        raise ValueError("training-state latest_eval_loss must be numeric or null")
+    return float(latest_eval_loss)
+
+
 def _restore_resume_state(
     *,
     resume_state: dict[str, Any] | None,
@@ -2032,6 +2271,7 @@ def _restore_resume_state(
     ind_stream: _CorpusStream | None,
     ood_stream: _CorpusStream | None,
     scheduler: _LanguageScheduler,
+    route_bias_annealer: _RouteBiasAnnealer,
 ) -> None:
     if resume_state is None:
         return
@@ -2064,6 +2304,220 @@ def _restore_resume_state(
     if not isinstance(language_scheduler_state, dict):
         raise ValueError("training-state language_scheduler_state_dict is missing")
     scheduler.load_state_dict(language_scheduler_state)
+    route_bias_annealer_state = resume_state.get("route_bias_annealer_state_dict")
+    if not isinstance(route_bias_annealer_state, dict):
+        raise ValueError("training-state route_bias_annealer_state_dict is missing")
+    route_bias_annealer.load_state_dict(route_bias_annealer_state)
+
+
+def _seed_training_random_generators(*, seed: int, torch_module: Any) -> None:
+    random.seed(seed)
+    manual_seed = getattr(torch_module, "manual_seed", None)
+    if callable(manual_seed):
+        manual_seed(seed)
+    cuda_module = getattr(torch_module, "cuda", None)
+    cuda_manual_seed_all = getattr(cuda_module, "manual_seed_all", None)
+    cuda_is_available = getattr(cuda_module, "is_available", None)
+    if callable(cuda_manual_seed_all) and callable(cuda_is_available) and cuda_is_available():
+        cuda_manual_seed_all(seed)
+    mps_module = getattr(torch_module, "mps", None)
+    mps_manual_seed = getattr(mps_module, "manual_seed", None)
+    mps_is_available = getattr(mps_module, "is_available", None)
+    if callable(mps_manual_seed) and callable(mps_is_available) and mps_is_available():
+        mps_manual_seed(seed)
+
+
+def _capture_training_random_generator_state(*, torch_module: Any) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "python_random_state": random.getstate(),
+        "torch_cpu_rng_state": None,
+        "torch_cuda_rng_state_all": None,
+        "torch_mps_rng_state": None,
+    }
+    get_rng_state = getattr(torch_module, "get_rng_state", None)
+    if callable(get_rng_state):
+        state["torch_cpu_rng_state"] = get_rng_state()
+    cuda_module = getattr(torch_module, "cuda", None)
+    cuda_is_available = getattr(cuda_module, "is_available", None)
+    cuda_get_rng_state_all = getattr(cuda_module, "get_rng_state_all", None)
+    if callable(cuda_is_available) and cuda_is_available() and callable(cuda_get_rng_state_all):
+        state["torch_cuda_rng_state_all"] = cuda_get_rng_state_all()
+    mps_module = getattr(torch_module, "mps", None)
+    mps_is_available = getattr(mps_module, "is_available", None)
+    mps_get_rng_state = getattr(mps_module, "get_rng_state", None)
+    if callable(mps_is_available) and mps_is_available() and callable(mps_get_rng_state):
+        state["torch_mps_rng_state"] = mps_get_rng_state()
+    return state
+
+
+def _restore_training_random_generator_state(
+    *,
+    resume_state: dict[str, Any] | None,
+    torch_module: Any,
+) -> None:
+    if resume_state is None:
+        return
+    rng_state = resume_state.get("random_generator_state_dict")
+    if not isinstance(rng_state, dict):
+        raise ValueError("training-state random_generator_state_dict is missing")
+    python_random_state = rng_state.get("python_random_state")
+    if python_random_state is None:
+        raise ValueError("training-state python_random_state is missing")
+    random.setstate(python_random_state)
+    torch_cpu_rng_state = rng_state.get("torch_cpu_rng_state")
+    set_rng_state = getattr(torch_module, "set_rng_state", None)
+    if torch_cpu_rng_state is not None and callable(set_rng_state):
+        set_rng_state(torch_cpu_rng_state)
+    torch_cuda_rng_state_all = rng_state.get("torch_cuda_rng_state_all")
+    cuda_module = getattr(torch_module, "cuda", None)
+    cuda_is_available = getattr(cuda_module, "is_available", None)
+    cuda_set_rng_state_all = getattr(cuda_module, "set_rng_state_all", None)
+    if (
+        torch_cuda_rng_state_all is not None
+        and callable(cuda_is_available)
+        and cuda_is_available()
+        and callable(cuda_set_rng_state_all)
+    ):
+        cuda_set_rng_state_all(torch_cuda_rng_state_all)
+    torch_mps_rng_state = rng_state.get("torch_mps_rng_state")
+    mps_module = getattr(torch_module, "mps", None)
+    mps_is_available = getattr(mps_module, "is_available", None)
+    mps_set_rng_state = getattr(mps_module, "set_rng_state", None)
+    if (
+        torch_mps_rng_state is not None
+        and callable(mps_is_available)
+        and mps_is_available()
+        and callable(mps_set_rng_state)
+    ):
+        mps_set_rng_state(torch_mps_rng_state)
+
+
+def _build_training_configuration_state(
+    *,
+    resolved_steps: int,
+    resolved_epochs: int | None,
+    teacher_model: str | Path,
+    ind_files: tuple[Path, ...],
+    ood_files: tuple[Path, ...],
+    eval_files: tuple[Path, ...],
+    resolved_device: str,
+    dtype: CompareDType,
+    batch_size: int,
+    eval_batch_size: int,
+    eval_max_batches: int,
+    weight_diff_every: int,
+    pad_to_max_length: bool | None,
+    torch_compile: bool,
+    distill_ind: bool,
+    distill_ood: bool,
+    distill_original_tokens_only: bool,
+    distill_every: int,
+    lr_warmup_steps: int,
+    gradient_accumulation_steps: int,
+    gradient_checkpointing: bool,
+    max_length: int,
+    learning_rate: float,
+    weight_decay: float,
+    distill_kl_vocab_chunk_size: int,
+    checkpoint_every: int,
+    checkpoint_dir: Path | None,
+    eval_every_steps: int,
+    log_every: int,
+    print_every: int,
+    ind_batches_per_cycle: int,
+    ood_batches_per_cycle: int,
+    ind_lm_weight: float,
+    ind_distill_weight: float,
+    ind_route_weight: float,
+    ind_route_logit_bias: float,
+    ood_lm_weight: float,
+    ood_distill_weight: float,
+    ood_route_weight: float,
+    ood_route_logit_bias: float,
+    route_logit_bias_anneal_steps: int,
+    route_logit_bias_anneal_loss_threshold: float,
+    router_learning_rate_multiplier: float,
+    parameter_selection: TrainingParameterSelection,
+    seed: int,
+) -> dict[str, Any]:
+    return {
+        "resolved_steps": resolved_steps,
+        "resolved_epochs": resolved_epochs,
+        "teacher_model": str(teacher_model),
+        "ind_files": [str(path) for path in ind_files],
+        "ood_files": [str(path) for path in ood_files],
+        "eval_files": [str(path) for path in eval_files],
+        "device": resolved_device,
+        "dtype": dtype,
+        "batch_size": batch_size,
+        "eval_batch_size": eval_batch_size,
+        "eval_max_batches": eval_max_batches,
+        "weight_diff_every": weight_diff_every,
+        "pad_to_max_length": pad_to_max_length,
+        "torch_compile": torch_compile,
+        "distill_ind": distill_ind,
+        "distill_ood": distill_ood,
+        "distill_original_tokens_only": distill_original_tokens_only,
+        "distill_every": distill_every,
+        "lr_warmup_steps": lr_warmup_steps,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "gradient_checkpointing": gradient_checkpointing,
+        "max_length": max_length,
+        "learning_rate": learning_rate,
+        "min_learning_rate": MIN_TRAIN_LEARNING_RATE,
+        "learning_rate_schedule": "linear_warmup_cosine_decay",
+        "weight_decay": weight_decay,
+        "distill_kl_vocab_chunk_size": distill_kl_vocab_chunk_size,
+        "checkpoint_every": checkpoint_every,
+        "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir is not None else None,
+        "eval_every_steps": eval_every_steps,
+        "log_every": log_every,
+        "print_every": print_every,
+        "ind_batches_per_cycle": ind_batches_per_cycle,
+        "ood_batches_per_cycle": ood_batches_per_cycle,
+        "ind_loss_weights": {
+            "lm": ind_lm_weight,
+            "distill": ind_distill_weight,
+            "route": ind_route_weight,
+        },
+        "ind_route_logit_bias": ind_route_logit_bias,
+        "ood_loss_weights": {
+            "lm": ood_lm_weight,
+            "distill": ood_distill_weight,
+            "route": ood_route_weight,
+        },
+        "ood_route_logit_bias": ood_route_logit_bias,
+        "route_logit_bias_anneal_steps": route_logit_bias_anneal_steps,
+        "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
+        "router_learning_rate_multiplier": router_learning_rate_multiplier,
+        "parameter_selection": asdict(parameter_selection),
+        "seed": seed,
+    }
+
+
+def _validate_resume_training_configuration(
+    *,
+    resume_state: dict[str, Any] | None,
+    training_configuration_state: dict[str, Any],
+) -> None:
+    if resume_state is None:
+        return
+    saved_configuration = resume_state.get("training_configuration")
+    if not isinstance(saved_configuration, dict):
+        raise ValueError("training-state training_configuration is missing")
+    if saved_configuration == training_configuration_state:
+        return
+    mismatched_keys = tuple(
+        key
+        for key in sorted(set(saved_configuration) | set(training_configuration_state))
+        if saved_configuration.get(key) != training_configuration_state.get(key)
+    )
+    preview = ", ".join(mismatched_keys[:8])
+    suffix = "" if len(mismatched_keys) <= 8 else f", ... ({len(mismatched_keys)} total)"
+    raise ValueError(
+        "Resume checkpoint was created with different training parameters: "
+        f"{preview}{suffix}"
+    )
 
 
 def _reapply_optimizer_hyperparameters(
@@ -2111,7 +2565,10 @@ def _save_training_checkpoint(
     ind_stream: _CorpusStream | None,
     ood_stream: _CorpusStream | None,
     scheduler: _LanguageScheduler,
+    route_bias_annealer: _RouteBiasAnnealer,
     step: int,
+    latest_eval_loss: float | None,
+    training_configuration_state: dict[str, Any],
     torch_module: Any,
 ) -> None:
     tqdm.write(f"Saving checkpoint ({step_label}) to {checkpoint_path}", file=sys.stderr)
@@ -2128,7 +2585,10 @@ def _save_training_checkpoint(
         ind_stream=ind_stream,
         ood_stream=ood_stream,
         scheduler=scheduler,
+        route_bias_annealer=route_bias_annealer,
         step=step,
+        latest_eval_loss=latest_eval_loss,
+        training_configuration_state=training_configuration_state,
         torch_module=torch_module,
     )
 
@@ -2141,16 +2601,26 @@ def _save_training_state(
     ind_stream: _CorpusStream | None,
     ood_stream: _CorpusStream | None,
     scheduler: _LanguageScheduler,
+    route_bias_annealer: _RouteBiasAnnealer,
     step: int,
+    latest_eval_loss: float | None,
+    training_configuration_state: dict[str, Any],
     torch_module: Any,
 ) -> None:
     state = {
+        "version": _TRAINING_STATE_VERSION,
         "step": step,
+        "latest_eval_loss": latest_eval_loss,
+        "training_configuration": training_configuration_state,
         "optimizer_state_dict": optimizer.state_dict(),
         "lr_scheduler_state_dict": None if lr_scheduler is None else lr_scheduler.state_dict(),
         "ind_stream_state_dict": None if ind_stream is None else ind_stream.state_dict(),
         "ood_stream_state_dict": None if ood_stream is None else ood_stream.state_dict(),
         "language_scheduler_state_dict": scheduler.state_dict(),
+        "route_bias_annealer_state_dict": route_bias_annealer.state_dict(),
+        "random_generator_state_dict": _capture_training_random_generator_state(
+            torch_module=torch_module,
+        ),
     }
     torch_module.save(state, checkpoint_path / _TRAINING_STATE_FILENAME)
 
@@ -2190,7 +2660,9 @@ def _write_training_recipe(
     ood_route_weight: float,
     ood_route_logit_bias: float,
     route_logit_bias_anneal_steps: int,
+    route_logit_bias_anneal_loss_threshold: float,
     router_learning_rate_multiplier: float,
+    parameter_selection: TrainingParameterSelection,
     distill_kl_vocab_chunk_size: int,
     checkpoint_every: int,
     checkpoint_dir: Path | None,
@@ -2241,7 +2713,9 @@ def _write_training_recipe(
         "ood_route_weight": ood_route_weight,
         "ood_route_logit_bias": ood_route_logit_bias,
         "route_logit_bias_anneal_steps": route_logit_bias_anneal_steps,
+        "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
         "router_learning_rate_multiplier": router_learning_rate_multiplier,
+        "parameter_selection": asdict(parameter_selection),
         "distill_kl_vocab_chunk_size": distill_kl_vocab_chunk_size,
         "checkpoint_every": checkpoint_every,
         "checkpoint_dir": str(checkpoint_dir) if checkpoint_dir is not None else None,
@@ -2655,6 +3129,7 @@ __all__ = [
     "TokenGroupMetadata",
     "TrainingDryRunReport",
     "TrainingLossWeights",
+    "TrainingParameterSelection",
     "build_training_dry_run_report",
     "load_token_group_metadata",
     "prepare_student_for_distillation",

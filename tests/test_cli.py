@@ -782,7 +782,13 @@ def test_train_command_invokes_distillation_training(
         ood_route_weight: float,
         ood_route_logit_bias: float,
         route_logit_bias_anneal_steps: int,
+        route_logit_bias_anneal_loss_threshold: float,
         router_learning_rate_multiplier: float,
+        train_shared: bool,
+        train_expert_0: bool,
+        train_expert_1: bool,
+        train_embedding_lm_head: bool,
+        train_full_embedding_lm_head: bool,
         seed: int,
         overwrite: bool,
         **kwargs: object,
@@ -821,7 +827,13 @@ def test_train_command_invokes_distillation_training(
         assert ood_route_weight == 0.0
         assert ood_route_logit_bias == 0.0
         assert route_logit_bias_anneal_steps == 0
+        assert route_logit_bias_anneal_loss_threshold == 0.25
         assert router_learning_rate_multiplier == 1.0
+        assert train_shared is True
+        assert train_expert_0 is True
+        assert train_expert_1 is False
+        assert train_embedding_lm_head is False
+        assert train_full_embedding_lm_head is True
         assert seed == 7
         assert overwrite is True
         return expected_path
@@ -878,6 +890,13 @@ def test_train_command_invokes_distillation_training(
             "1.0",
             "--ood-distill-weight",
             "0.3",
+            "--route-logit-bias-anneal-loss-threshold",
+            "0.25",
+            "--train-shared",
+            "--train-expert-0",
+            "--freeze-expert-1",
+            "--freeze-embedding-lmhead",
+            "--train-full-embedding-lmhead",
             "--device",
             "cpu",
             "--dtype",
@@ -932,7 +951,13 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "ood_route_weight": 0.0,
                 "ood_route_logit_bias": 0.0,
                 "route_logit_bias_anneal_steps": 0,
+                "route_logit_bias_anneal_loss_threshold": 5e-2,
                 "router_learning_rate_multiplier": 1.0,
+                "train_shared": False,
+                "train_expert_0": False,
+                "train_expert_1": True,
+                "train_embedding_lm_head": True,
+                "train_full_embedding_lm_head": False,
                 "checkpoint_every": 0,
                 "checkpoint_dir": None,
                 "masked_row_parameter_names": ("model.embed_tokens.weight", "lm_head.weight"),
@@ -976,6 +1001,12 @@ def test_train_command_dry_run_prints_report_and_skips_training(
     assert dry_run_payload["dry_run"]["added_token_ids"] == [1, 3]
     assert dry_run_payload["dry_run"]["gradient_accumulation"] == 8
     assert dry_run_payload["dry_run"]["gradient_checkpointing"] is True
+    assert dry_run_payload["dry_run"]["route_logit_bias_anneal_loss_threshold"] == 5e-2
+    assert dry_run_payload["dry_run"]["train_shared"] is False
+    assert dry_run_payload["dry_run"]["train_expert_0"] is False
+    assert dry_run_payload["dry_run"]["train_expert_1"] is True
+    assert dry_run_payload["dry_run"]["train_embedding_lm_head"] is True
+    assert dry_run_payload["dry_run"]["train_full_embedding_lm_head"] is False
     assert dry_run_payload["dry_run"]["checkpoint_every"] == 0
     assert dry_run_payload["dry_run"]["checkpoint_dir"] is None
 

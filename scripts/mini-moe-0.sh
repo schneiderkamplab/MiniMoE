@@ -1,0 +1,32 @@
+#!/bin/bash
+scripts/mini-moe-train.sh 0 \
+  --overwrite \
+  --steps 1000 \
+  --print-every 1 \
+  --batch-size 4 \
+  --gradient-accumulation 4 \
+  --max-length 256 \
+  --pad-to-max-length \
+  --no-gradient-checkpointing \
+  --learning-rate 2.5e-5 \
+  --lr-warmup-steps 75 \
+  --no-distill-ind \
+  --no-distill-ood \
+  --ind-batches-per-cycle 1 \
+  --ood-batches-per-cycle 1 \
+  --ind-lm-weight 1.0 \
+  --ood-lm-weight 1.0 \
+  --ind-route-weight 0.20 \
+  --ood-route-weight 0.20 \
+  --ind-route-logit-bias -2.0 \
+  --ood-route-logit-bias 2.0 \
+  --route-logit-bias-anneal-steps 500 \
+  --train-shared \
+  --train-expert-0 \
+  --train-expert-1 \
+  --train-embedding-lmhead \
+  --router-learning-rate-multiplier 20 \
+  --weight-diff-every 5 \
+  --eval-every 50 \
+  --eval-max-batches 32
+

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -42,10 +43,17 @@ def _parse_args() -> argparse.Namespace:
         help="Output PNG path (default: <metrics_dir>/training_metrics_plot.png)",
     )
     parser.add_argument(
+        "--average-steps",
         "--rolling-window",
         type=int,
         default=5,
-        help="Rolling average window for noisy loss curves (default: 5)",
+        help="Number of steps in the rolling average for noisy curves (default: 5)",
+    )
+    parser.add_argument(
+        "--outlier-proportion",
+        type=float,
+        default=0.01,
+        help="Total proportion of finite y-values to exclude when autoscaling each axis; use 0 to disable (default: 0.01)",
     )
     parser.add_argument(
         "--title",
@@ -64,6 +72,79 @@ def _load_rows(path: Path) -> list[dict[str, Any]]:
 
 def _metric(rows: list[dict[str, Any]], key: str) -> list[float | None]:
     return [row.get(key) for row in rows]
+
+
+def _finite_values(values: list[float | None]) -> list[float]:
+    return [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float)) and math.isfinite(float(value))
+    ]
+
+
+def _quantile(sorted_values: list[float], fraction: float) -> float:
+    if not sorted_values:
+        raise ValueError("Cannot compute a quantile of an empty sequence")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * max(0.0, min(1.0, fraction))
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return sorted_values[lower_index]
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    return lower_value + (upper_value - lower_value) * (position - lower_index)
+
+
+def _trimmed_limits(
+    values: list[float | None],
+    *,
+    outlier_proportion: float,
+    lower_bound: float | None = None,
+    upper_bound: float | None = None,
+) -> tuple[float, float] | None:
+    finite_values = sorted(_finite_values(values))
+    if not finite_values or outlier_proportion <= 0:
+        return None
+    tail_fraction = min(outlier_proportion, 0.99) / 2.0
+    low = _quantile(finite_values, tail_fraction)
+    high = _quantile(finite_values, 1.0 - tail_fraction)
+    if lower_bound is not None:
+        low = max(low, lower_bound)
+    if upper_bound is not None:
+        high = min(high, upper_bound)
+    if low == high:
+        padding = max(abs(low) * 0.05, 1e-6)
+    else:
+        padding = (high - low) * 0.05
+    low -= padding
+    high += padding
+    if lower_bound is not None:
+        low = max(low, lower_bound)
+    if upper_bound is not None:
+        high = min(high, upper_bound)
+    if low >= high:
+        return None
+    return low, high
+
+
+def _apply_trimmed_ylim(
+    ax: Any,
+    values: list[float | None],
+    *,
+    outlier_proportion: float,
+    lower_bound: float | None = None,
+    upper_bound: float | None = None,
+) -> None:
+    limits = _trimmed_limits(
+        values,
+        outlier_proportion=outlier_proportion,
+        lower_bound=lower_bound,
+        upper_bound=upper_bound,
+    )
+    if limits is not None:
+        ax.set_ylim(*limits)
 
 
 def _rolling(values: list[float | None], window: int) -> list[float | None]:
@@ -101,6 +182,13 @@ def _plot_metric(
         )
 
 
+def _metric_values(rows: list[dict[str, Any]], *keys: str) -> list[float | None]:
+    values: list[float | None] = []
+    for key in keys:
+        values.extend(_metric(rows, key))
+    return values
+
+
 def _plot_eval(ax: Any, rows: list[dict[str, Any]]) -> None:
     eval_points = [
         (row["step"], row["eval_lm_loss"])
@@ -120,7 +208,10 @@ def _plot_metrics(
     *,
     title: str,
     rolling_window: int,
+    outlier_proportion: float,
 ) -> None:
+    if not 0 <= outlier_proportion < 1:
+        raise SystemExit("--outlier-proportion must be at least 0 and less than 1")
     steps = [row["step"] for row in rows]
 
     plt.style.use("seaborn-v0_8-whitegrid")
@@ -134,6 +225,11 @@ def _plot_metrics(
     ax.set_title("OOD Loss")
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
+    _apply_trimmed_ylim(
+        ax,
+        _metric_values(rows, "ood_train_loss", "ood_train_task_loss", "eval_lm_loss"),
+        outlier_proportion=outlier_proportion,
+    )
     ax.legend(fontsize=8)
 
     ax = axes[0, 1]
@@ -150,6 +246,11 @@ def _plot_metrics(
     ax.set_title("IND Loss")
     ax.set_xlabel("step")
     ax.set_ylabel("loss")
+    _apply_trimmed_ylim(
+        ax,
+        _metric_values(rows, "ind_train_loss", "ind_train_task_loss"),
+        outlier_proportion=outlier_proportion,
+    )
     ax.legend(fontsize=8)
 
     ax = axes[1, 0]
@@ -168,13 +269,33 @@ def _plot_metrics(
     ax2 = ax.twinx()
     route_loss = _metric(rows, "train_route_loss")
     if any(value is not None for value in route_loss):
-        ax2.plot(steps, route_loss, label="route loss", color="#c5962b", linewidth=1.8)
+        ax2.plot(steps, route_loss, label="route loss", color="#c5962b", linewidth=1.2, alpha=0.38)
+        if rolling_window > 1 and len(route_loss) >= 3:
+            ax2.plot(
+                steps,
+                _rolling(route_loss, rolling_window),
+                label=f"route loss {rolling_window}-step avg",
+                color="#c5962b",
+                linewidth=2.0,
+            )
     ax.set_title("Bias Anneal, LR, Route Loss")
     ax.set_xlabel("step")
     ax.set_ylabel("bias scale / LR")
     ax2.set_ylabel("route loss")
     lines, labels = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
+    _apply_trimmed_ylim(
+        ax,
+        _metric_values(rows, "route_logit_bias_scale", "learning_rate"),
+        outlier_proportion=outlier_proportion,
+        lower_bound=0.0,
+    )
+    _apply_trimmed_ylim(
+        ax2,
+        route_loss,
+        outlier_proportion=outlier_proportion,
+        lower_bound=0.0,
+    )
     ax.legend(lines + lines2, labels + labels2, fontsize=8)
 
     ax = axes[2, 0]
@@ -183,6 +304,16 @@ def _plot_metrics(
     ax.set_title("Router Expert Parameter Separation")
     ax.set_xlabel("step")
     ax.set_ylabel("diff")
+    _apply_trimmed_ylim(
+        ax,
+        _metric_values(
+            rows,
+            "router_expert_weight_diff_mean_abs",
+            "router_expert_weight_diff_mean_squared",
+        ),
+        outlier_proportion=outlier_proportion,
+        lower_bound=0.0,
+    )
     ax.legend(fontsize=8)
 
     ax = axes[2, 1]
@@ -191,6 +322,12 @@ def _plot_metrics(
     ax.set_title("FFN Expert Parameter Separation")
     ax.set_xlabel("step")
     ax.set_ylabel("diff")
+    _apply_trimmed_ylim(
+        ax,
+        _metric_values(rows, "expert_weight_diff_mean_abs", "expert_weight_diff_mean_squared"),
+        outlier_proportion=outlier_proportion,
+        lower_bound=0.0,
+    )
     ax.legend(fontsize=8)
 
     for ax in axes.ravel():
@@ -206,7 +343,13 @@ def main() -> None:
     metrics_path = args.metrics_path
     output_path = args.output or metrics_path.with_name("training_metrics_plot.png")
     rows = _load_rows(metrics_path)
-    _plot_metrics(rows, output_path, title=args.title, rolling_window=args.rolling_window)
+    _plot_metrics(
+        rows,
+        output_path,
+        title=args.title,
+        rolling_window=args.average_steps,
+        outlier_proportion=args.outlier_proportion,
+    )
     print(output_path.resolve())
 
 
