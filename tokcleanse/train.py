@@ -109,6 +109,7 @@ class TrainingDryRunReport:
     distill_ood: bool
     distill_original_tokens_only: bool
     distill_every: int
+    combined_loss: bool
     lr_warmup_steps: int
     gradient_accumulation_steps: int
     gradient_checkpointing: bool
@@ -503,6 +504,7 @@ def build_training_dry_run_report(
     distill_ood: bool = True,
     distill_original_tokens_only: bool = False,
     distill_every: int = 1,
+    combined_loss: bool = False,
     lr_warmup_steps: int = DEFAULT_TRAIN_LR_WARMUP_STEPS,
     gradient_accumulation_steps: int = DEFAULT_TRAIN_GRADIENT_ACCUMULATION_STEPS,
     gradient_checkpointing: bool = True,
@@ -680,6 +682,7 @@ def build_training_dry_run_report(
             distill_ood=distill_ood,
             distill_original_tokens_only=distill_original_tokens_only,
             distill_every=distill_every,
+            combined_loss=combined_loss,
             lr_warmup_steps=lr_warmup_steps,
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=gradient_checkpointing,
@@ -741,6 +744,7 @@ def train_distilled_model(
     distill_ood: bool = True,
     distill_original_tokens_only: bool = False,
     distill_every: int = 1,
+    combined_loss: bool = False,
     lr_warmup_steps: int = DEFAULT_TRAIN_LR_WARMUP_STEPS,
     gradient_accumulation_steps: int = DEFAULT_TRAIN_GRADIENT_ACCUMULATION_STEPS,
     gradient_checkpointing: bool = True,
@@ -920,6 +924,7 @@ def train_distilled_model(
         distill_ood=distill_ood,
         distill_original_tokens_only=distill_original_tokens_only,
         distill_every=distill_every,
+        combined_loss=combined_loss,
         lr_warmup_steps=lr_warmup_steps,
         gradient_accumulation_steps=gradient_accumulation_steps,
         gradient_checkpointing=gradient_checkpointing,
@@ -1265,16 +1270,18 @@ def train_distilled_model(
                     weighted_route_loss = weights.route * route_loss
                     total_loss = task_loss + weighted_route_loss
                     t0 = time.perf_counter()
-                    has_route_backward = _loss_requires_grad(weighted_route_loss) and bool(router_trainable_parameters)
+                    task_backward_loss = total_loss if combined_loss else task_loss
+                    router_backward_loss = total_loss if combined_loss else weighted_route_loss
+                    has_route_backward = _loss_requires_grad(router_backward_loss) and bool(router_trainable_parameters)
                     _backward_loss_for_parameters(
-                        loss=task_loss,
+                        loss=task_backward_loss,
                         parameters=task_trainable_parameters,
                         gradient_scale=1.0 / gradient_accumulation_steps,
                         retain_graph=has_route_backward,
                         torch_module=torch,
                     )
                     _backward_loss_for_parameters(
-                        loss=weighted_route_loss,
+                        loss=router_backward_loss,
                         parameters=router_trainable_parameters,
                         gradient_scale=1.0 / gradient_accumulation_steps,
                         retain_graph=False,
@@ -1310,6 +1317,8 @@ def train_distilled_model(
                     if router_metric_collector is not None:
                         router_metric_collector.deactivate()
                     total_loss = None
+                    task_backward_loss = None
+                    router_backward_loss = None
                     weighted_route_loss = None
                     task_loss = None
                     route_loss = None
@@ -1434,6 +1443,7 @@ def train_distilled_model(
                 "train_weighted_lm_loss": step_metrics["weighted_lm_loss"] / gradient_accumulation_steps,
                 "train_weighted_distill_loss": step_metrics["weighted_distill_loss"] / gradient_accumulation_steps,
                 "train_weighted_route_loss": average_weighted_route_loss,
+                "combined_loss": combined_loss,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "main_learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "min_learning_rate": min_learning_rate,
@@ -1611,6 +1621,7 @@ def train_distilled_model(
             distill_ood=distill_ood,
             distill_original_tokens_only=distill_original_tokens_only,
             distill_every=distill_every,
+            combined_loss=combined_loss,
             metrics_log_path=metrics_log_path,
             ind_batches_per_cycle=ind_batches_per_cycle,
             ood_batches_per_cycle=ood_batches_per_cycle,
@@ -2725,6 +2736,7 @@ def _build_training_configuration_state(
     distill_ood: bool,
     distill_original_tokens_only: bool,
     distill_every: int,
+    combined_loss: bool,
     lr_warmup_steps: int,
     gradient_accumulation_steps: int,
     gradient_checkpointing: bool,
@@ -2778,6 +2790,7 @@ def _build_training_configuration_state(
         "distill_ood": distill_ood,
         "distill_original_tokens_only": distill_original_tokens_only,
         "distill_every": distill_every,
+        "combined_loss": combined_loss,
         "lr_warmup_steps": lr_warmup_steps,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "gradient_checkpointing": gradient_checkpointing,
@@ -2985,6 +2998,7 @@ def _write_training_recipe(
     distill_ood: bool,
     distill_original_tokens_only: bool,
     distill_every: int,
+    combined_loss: bool,
     max_length: int,
     learning_rate: float,
     min_learning_rate: float,
@@ -3042,6 +3056,7 @@ def _write_training_recipe(
         "distill_ood": distill_ood,
         "distill_original_tokens_only": distill_original_tokens_only,
         "distill_every": distill_every,
+        "combined_loss": combined_loss,
         "max_length": max_length,
         "learning_rate": learning_rate,
         "min_learning_rate": min_learning_rate,
