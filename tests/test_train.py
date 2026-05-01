@@ -14,6 +14,7 @@ from tokcleanse.train import (
     _CorpusStream,
     _LanguageScheduler,
     _RouteBiasAnnealer,
+    _backward_loss_for_parameters,
     _build_training_configuration_state,
     _build_learning_rate_scheduler,
     _capture_training_random_generator_state,
@@ -140,6 +141,40 @@ class _EvalModel:
 
     def train(self) -> None:
         self.training = True
+
+
+def test_backward_loss_for_parameters_keeps_task_and_router_gradients_separate() -> None:
+    shared = torch.nn.Parameter(torch.tensor(2.0))
+    expert = torch.nn.Parameter(torch.tensor(3.0))
+    router = torch.nn.Parameter(torch.tensor(5.0))
+    task_loss = (shared * router + expert).square()
+    route_loss = (shared * router).square()
+
+    _backward_loss_for_parameters(
+        loss=task_loss,
+        parameters=[shared, expert],
+        gradient_scale=1.0,
+        retain_graph=True,
+        torch_module=torch,
+    )
+
+    assert shared.grad is not None
+    assert expert.grad is not None
+    assert router.grad is None
+    shared_task_grad = shared.grad.clone()
+    expert_task_grad = expert.grad.clone()
+
+    _backward_loss_for_parameters(
+        loss=route_loss,
+        parameters=[router],
+        gradient_scale=1.0,
+        retain_graph=False,
+        torch_module=torch,
+    )
+
+    assert torch.equal(shared.grad, shared_task_grad)
+    assert torch.equal(expert.grad, expert_task_grad)
+    assert router.grad is not None
 
 
 def test_load_token_group_metadata_reads_saved_groups(tmp_path: Path) -> None:
@@ -668,6 +703,8 @@ def test_build_training_dry_run_report_lists_trainable_parameters(
     assert report.checkpoint_every == 0
     assert report.checkpoint_dir is None
     assert report.lr_warmup_steps == 0
+    assert report.min_learning_rate == pytest.approx(1e-8)
+    assert report.router_lr_warmup_steps == 0
     assert "model.embed_tokens.weight" in report.masked_row_parameter_names
     assert "lm_head.weight" in report.masked_row_parameter_names
     assert "model.layers.0.experts.gate_up_proj" in report.trainable_parameter_names
@@ -712,9 +749,9 @@ def test_print_training_metrics_includes_mix_and_per_language_losses() -> None:
         )
 
     assert output.getvalue().strip() == (
-        "step=10 mix=4ind/4ood train_loss=5.0000 train_lm_loss=6.0000 "
-        "train_distill_loss=3.0000 lr=5.00e-05 ind_train_loss=4.5000 ood_train_loss=5.5000 "
-        "latest_eval_lm_loss=7.0000"
+        "step=10 mix=4ind/4ood train_objective=5.0000 train_lm_loss=6.0000 "
+        "train_distill_loss=3.0000 ind_train_loss=4.5000 ood_train_loss=5.5000 "
+        "main_lr=5.00e-05 latest_eval_lm_loss=7.0000"
     )
 
 
@@ -775,6 +812,25 @@ def test_learning_rate_scheduler_state_dict_restores_progress() -> None:
     assert restored_optimizer.param_groups[0]["lr"] == pytest.approx(saved_lr)
 
 
+def test_learning_rate_scheduler_stays_constant_without_warmup_when_min_equals_base() -> None:
+    parameter = torch.nn.Parameter(torch.tensor(1.0))
+    optimizer = torch.optim.AdamW([parameter], lr=1.0)
+    scheduler = _build_learning_rate_scheduler(
+        optimizer=optimizer,
+        warmup_steps=0,
+        total_steps=4,
+        min_learning_rate=1.0,
+        base_learning_rate=1.0,
+        torch_module=torch,
+    )
+
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+    for _ in range(5):
+        optimizer.step()
+        scheduler.step()
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+
+
 def test_corpus_stream_state_dict_restores_position(tmp_path: Path) -> None:
     first_path = tmp_path / "a.txt"
     second_path = tmp_path / "b.txt"
@@ -833,6 +889,31 @@ def test_route_bias_annealer_pauses_above_threshold_and_advances_below() -> None
     assert restored.scale() == pytest.approx(0.75)
 
 
+def test_route_bias_annealer_waits_for_offset_before_advancing() -> None:
+    annealer = _RouteBiasAnnealer(anneal_steps=4, loss_threshold=0.05, offset_steps=2)
+
+    assert annealer.scale() == pytest.approx(1.0)
+    assert annealer.observe_route_loss(0.0) is False
+    assert annealer.completed_anneal_steps == 0
+    assert annealer.observed_steps == 1
+    assert annealer.observe_route_loss(0.0) is False
+    assert annealer.completed_anneal_steps == 0
+    assert annealer.observed_steps == 2
+    assert annealer.scale() == pytest.approx(1.0)
+
+    assert annealer.observe_route_loss(0.0) is True
+    assert annealer.completed_anneal_steps == 1
+    assert annealer.observed_steps == 3
+    assert annealer.scale() == pytest.approx(0.75)
+
+    state = annealer.state_dict()
+    restored = _RouteBiasAnnealer(anneal_steps=4, loss_threshold=0.05, offset_steps=2)
+    restored.load_state_dict(state)
+    assert restored.completed_anneal_steps == 1
+    assert restored.observed_steps == 3
+    assert restored.scale() == pytest.approx(0.75)
+
+
 def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: Path) -> None:
     configuration = _build_training_configuration_state(
         resolved_steps=100,
@@ -858,6 +939,8 @@ def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: 
         gradient_checkpointing=False,
         max_length=256,
         learning_rate=1e-3,
+        min_learning_rate=1e-8,
+        max_grad_norm=10.0,
         weight_decay=0.0,
         distill_kl_vocab_chunk_size=0,
         checkpoint_every=25,
@@ -876,8 +959,10 @@ def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: 
         ood_route_weight=0.02,
         ood_route_logit_bias=1.25,
         route_logit_bias_anneal_steps=750,
+        route_logit_bias_anneal_offset_steps=0,
         route_logit_bias_anneal_loss_threshold=5e-2,
         router_learning_rate=1e-3,
+        router_lr_warmup_steps=0,
         router_lr_anneal_steps=100,
         router_min_learning_rate=1e-6,
         parameter_selection=TrainingParameterSelection(
@@ -933,9 +1018,9 @@ def test_print_training_metrics_includes_timing_fields_when_present() -> None:
         )
 
     assert output.getvalue().strip() == (
-        "step=12 mix=4ind/4ood train_loss=5.0000 train_lm_loss=6.0000 "
-        "train_distill_loss=3.0000 lr=5.00e-05 ind_train_loss=4.5000 ood_train_loss=5.5000 "
-        "step_s=9.88s data_s=0.12s tok_s=0.34s move_s=0.56s stu_s=1.23s "
+        "step=12 mix=4ind/4ood train_objective=5.0000 train_lm_loss=6.0000 "
+        "train_distill_loss=3.0000 ind_train_loss=4.5000 ood_train_loss=5.5000 "
+        "main_lr=5.00e-05 step_s=9.88s data_s=0.12s tok_s=0.34s move_s=0.56s stu_s=1.23s "
         "tea_s=2.34s lm_s=0.45s kl_s=0.67s back_s=3.21s opt_s=0.89s eval_s=4.56s "
         "latest_eval_lm_loss=7.0000"
     )
@@ -1086,9 +1171,9 @@ def test_print_training_metrics_includes_mps_memory_fields() -> None:
         )
 
     assert output.getvalue().strip() == (
-        "step=11 mix=4ind/4ood train_loss=5.0000 train_lm_loss=6.0000 "
-        "train_distill_loss=3.0000 lr=5.00e-05 ind_train_loss=4.5000 ood_train_loss=5.5000 "
-        "latest_eval_lm_loss=7.0000 mps_allocated=3.00GiB mps_driver=5.00GiB "
+        "step=11 mix=4ind/4ood train_objective=5.0000 train_lm_loss=6.0000 "
+        "train_distill_loss=3.0000 ind_train_loss=4.5000 ood_train_loss=5.5000 "
+        "main_lr=5.00e-05 latest_eval_lm_loss=7.0000 mps_allocated=3.00GiB mps_driver=5.00GiB "
         "mps_headroom=3.00GiB"
     )
 

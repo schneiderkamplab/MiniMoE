@@ -1311,6 +1311,8 @@ class Gemma4TextRouter(nn.Module):
         hidden_states = hidden_states * self.scale * self.scalar_root_size
 
         expert_scores = self.proj(hidden_states)  # [B*S, E]
+        unbiased_router_probabilities = nn.functional.softmax(expert_scores, dim=-1)
+        self._odin_unbiased_router_probabilities = unbiased_router_probabilities
         expert1_logit_bias = getattr(self, "_odin_expert1_logit_bias", None)
         if expert1_logit_bias is not None and expert_scores.shape[-1] > 1:
             bias = expert_scores.new_tensor(float(expert1_logit_bias))

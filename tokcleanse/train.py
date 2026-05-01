@@ -27,9 +27,11 @@ DEFAULT_TRAIN_STEPS = -1
 DEFAULT_TRAIN_GRADIENT_ACCUMULATION_STEPS = 8
 DEFAULT_TRAIN_TORCH_COMPILE: bool | None = None
 DEFAULT_TRAIN_LEARNING_RATE = 5e-5
+DEFAULT_TRAIN_MIN_LEARNING_RATE = 1e-8
 DEFAULT_TRAIN_LR_WARMUP_STEPS = 0
-MIN_TRAIN_LEARNING_RATE = 1e-8
+DEFAULT_TRAIN_MAX_GRAD_NORM = 10.0
 DEFAULT_ROUTER_LEARNING_RATE = 1e-3
+DEFAULT_ROUTER_LR_WARMUP_STEPS = 0
 DEFAULT_ROUTER_LR_ANNEAL_STEPS = 100
 DEFAULT_ROUTER_MIN_LEARNING_RATE = 1e-6
 DEFAULT_TRAIN_EVAL_EVERY = 50
@@ -111,14 +113,18 @@ class TrainingDryRunReport:
     gradient_accumulation_steps: int
     gradient_checkpointing: bool
     learning_rate: float
+    min_learning_rate: float
+    max_grad_norm: float
     weight_decay: float
     ind_route_weight: float
     ind_route_logit_bias: float
     ood_route_weight: float
     ood_route_logit_bias: float
     route_logit_bias_anneal_steps: int
+    route_logit_bias_anneal_offset_steps: int
     route_logit_bias_anneal_loss_threshold: float
     router_learning_rate: float
+    router_lr_warmup_steps: int
     router_lr_anneal_steps: int
     router_min_learning_rate: float
     train_shared: bool
@@ -147,6 +153,7 @@ class _MpsMemorySnapshot:
 @dataclass(slots=True)
 class _RouterRoutingMetrics:
     probability_sum: float = 0.0
+    unbiased_probability_sum: float = 0.0
     weight_sum: float = 0.0
     token_layer_count: int = 0
 
@@ -224,11 +231,15 @@ class _LearningRateScheduler:
 class _RouteBiasAnnealer:
     anneal_steps: int
     loss_threshold: float
+    offset_steps: int = 0
     completed_anneal_steps: int = 0
+    observed_steps: int = 0
 
     def __post_init__(self) -> None:
         if self.anneal_steps < 0:
             raise ValueError("anneal_steps cannot be negative")
+        if self.offset_steps < 0:
+            raise ValueError("offset_steps cannot be negative")
         if self.loss_threshold < 0:
             raise ValueError("loss_threshold cannot be negative")
 
@@ -243,6 +254,9 @@ class _RouteBiasAnnealer:
     def observe_route_loss(self, route_loss: float) -> bool:
         if self.anneal_steps <= 0:
             return False
+        self.observed_steps += 1
+        if self.observed_steps <= self.offset_steps:
+            return False
         if math.isfinite(route_loss) and route_loss <= self.loss_threshold:
             self.completed_anneal_steps = min(self.completed_anneal_steps + 1, self.anneal_steps)
             return True
@@ -252,20 +266,29 @@ class _RouteBiasAnnealer:
         return {
             "anneal_steps": self.anneal_steps,
             "loss_threshold": self.loss_threshold,
+            "offset_steps": self.offset_steps,
             "completed_anneal_steps": self.completed_anneal_steps,
+            "observed_steps": self.observed_steps,
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         anneal_steps = state_dict.get("anneal_steps", self.anneal_steps)
         loss_threshold = state_dict.get("loss_threshold", self.loss_threshold)
+        offset_steps = state_dict.get("offset_steps", self.offset_steps)
         if anneal_steps != self.anneal_steps:
             raise ValueError("training-state route_bias_annealer anneal_steps does not match current run")
         if loss_threshold != self.loss_threshold:
             raise ValueError("training-state route_bias_annealer loss_threshold does not match current run")
+        if offset_steps != self.offset_steps:
+            raise ValueError("training-state route_bias_annealer offset_steps does not match current run")
         completed_anneal_steps = state_dict.get("completed_anneal_steps", 0)
         if not isinstance(completed_anneal_steps, int) or completed_anneal_steps < 0:
             raise ValueError("training-state route_bias_annealer completed_anneal_steps is invalid")
+        observed_steps = state_dict.get("observed_steps", 0)
+        if not isinstance(observed_steps, int) or observed_steps < 0:
+            raise ValueError("training-state route_bias_annealer observed_steps is invalid")
         self.completed_anneal_steps = min(completed_anneal_steps, max(self.anneal_steps, 0))
+        self.observed_steps = observed_steps
 
 
 def load_token_group_metadata(model_path: str | Path) -> TokenGroupMetadata:
@@ -386,10 +409,18 @@ class _RouterRoutingMetricCollector:
         for language, metrics in self._metrics.items():
             if metrics.token_layer_count > 0:
                 denominator = float(metrics.token_layer_count)
-                result[f"{language}_router_prob_expert{self._expert_index}"] = metrics.probability_sum / denominator
+                probability = metrics.probability_sum / denominator
+                unbiased_probability = metrics.unbiased_probability_sum / denominator
+                result[f"{language}_router_prob_expert{self._expert_index}"] = probability
+                result[f"{language}_router_unbiased_prob_expert{self._expert_index}"] = unbiased_probability
+                result[f"{language}_router_bias_prob_delta_expert{self._expert_index}"] = (
+                    probability - unbiased_probability
+                )
                 result[f"{language}_router_weight_expert{self._expert_index}"] = metrics.weight_sum / denominator
             else:
                 result[f"{language}_router_prob_expert{self._expert_index}"] = None
+                result[f"{language}_router_unbiased_prob_expert{self._expert_index}"] = None
+                result[f"{language}_router_bias_prob_delta_expert{self._expert_index}"] = None
                 result[f"{language}_router_weight_expert{self._expert_index}"] = None
         return result
 
@@ -412,6 +443,15 @@ class _RouterRoutingMetricCollector:
             return
         with self._torch.no_grad():
             probabilities = router_probabilities.detach()
+            unbiased_router_probabilities = getattr(_module, "_odin_unbiased_router_probabilities", None)
+            if (
+                unbiased_router_probabilities is not None
+                and hasattr(unbiased_router_probabilities, "detach")
+                and unbiased_router_probabilities.shape == router_probabilities.shape
+            ):
+                unbiased_probabilities = unbiased_router_probabilities.detach()
+            else:
+                unbiased_probabilities = probabilities
             weights = top_k_weights.detach()
             indices = top_k_index.detach()
             if probabilities.ndim != 2 or weights.ndim != 2 or indices.ndim != 2:
@@ -419,11 +459,15 @@ class _RouterRoutingMetricCollector:
             if self._expert_index >= int(probabilities.shape[-1]):
                 return
             expert_probability_sum = float(probabilities[:, self._expert_index].sum().cpu())
+            unbiased_expert_probability_sum = float(
+                unbiased_probabilities[:, self._expert_index].sum().cpu()
+            )
             expert_weight_mask = indices == self._expert_index
             expert_weight_sum = float(weights.masked_select(expert_weight_mask).sum().cpu())
             token_count = int(probabilities.shape[0])
         metrics = self._metrics[language]
         metrics.probability_sum += expert_probability_sum
+        metrics.unbiased_probability_sum += unbiased_expert_probability_sum
         metrics.weight_sum += expert_weight_sum
         metrics.token_layer_count += token_count
         target_expert_index = 0 if language == "ind" else self._expert_index
@@ -463,6 +507,8 @@ def build_training_dry_run_report(
     gradient_accumulation_steps: int = DEFAULT_TRAIN_GRADIENT_ACCUMULATION_STEPS,
     gradient_checkpointing: bool = True,
     learning_rate: float = DEFAULT_TRAIN_LEARNING_RATE,
+    min_learning_rate: float = DEFAULT_TRAIN_MIN_LEARNING_RATE,
+    max_grad_norm: float = DEFAULT_TRAIN_MAX_GRAD_NORM,
     weight_decay: float = 0.0,
     distill_kl_vocab_chunk_size: int = DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE,
     checkpoint_every: int = 0,
@@ -474,8 +520,10 @@ def build_training_dry_run_report(
     ood_route_weight: float = 0.0,
     ood_route_logit_bias: float = 0.0,
     route_logit_bias_anneal_steps: int = 0,
+    route_logit_bias_anneal_offset_steps: int = 0,
     route_logit_bias_anneal_loss_threshold: float = 5e-2,
     router_learning_rate: float = DEFAULT_ROUTER_LEARNING_RATE,
+    router_lr_warmup_steps: int = DEFAULT_ROUTER_LR_WARMUP_STEPS,
     router_lr_anneal_steps: int = DEFAULT_ROUTER_LR_ANNEAL_STEPS,
     router_min_learning_rate: float = DEFAULT_ROUTER_MIN_LEARNING_RATE,
     train_shared: bool = False,
@@ -505,14 +553,22 @@ def build_training_dry_run_report(
         raise ValueError("--gradient-accumulation must be at least 1")
     if learning_rate <= 0:
         raise ValueError("--learning-rate must be positive")
+    if min_learning_rate <= 0:
+        raise ValueError("--min-learning-rate must be positive")
+    if max_grad_norm < 0:
+        raise ValueError("--max-grad-norm cannot be negative")
     if ind_route_weight < 0 or ood_route_weight < 0:
         raise ValueError("--ind-route-weight and --ood-route-weight cannot be negative")
     if route_logit_bias_anneal_steps < 0:
         raise ValueError("--route-logit-bias-anneal-steps cannot be negative")
+    if route_logit_bias_anneal_offset_steps < 0:
+        raise ValueError("--route-logit-bias-anneal-offset-steps cannot be negative")
     if route_logit_bias_anneal_loss_threshold < 0:
         raise ValueError("--route-logit-bias-anneal-loss-threshold cannot be negative")
     if router_learning_rate <= 0:
         raise ValueError("--router-learning-rate must be positive")
+    if router_lr_warmup_steps < 0:
+        raise ValueError("--router-lr-warmup-steps cannot be negative")
     if router_lr_anneal_steps < 1:
         raise ValueError("--router-lr-anneal-steps must be at least 1")
     if router_min_learning_rate <= 0:
@@ -628,14 +684,18 @@ def build_training_dry_run_report(
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=gradient_checkpointing,
             learning_rate=learning_rate,
+            min_learning_rate=min_learning_rate,
+            max_grad_norm=max_grad_norm,
             weight_decay=weight_decay,
             ind_route_weight=ind_route_weight,
             ind_route_logit_bias=ind_route_logit_bias,
             ood_route_weight=ood_route_weight,
             ood_route_logit_bias=ood_route_logit_bias,
             route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
+            route_logit_bias_anneal_offset_steps=route_logit_bias_anneal_offset_steps,
             route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
             router_learning_rate=router_learning_rate,
+            router_lr_warmup_steps=router_lr_warmup_steps,
             router_lr_anneal_steps=router_lr_anneal_steps,
             router_min_learning_rate=router_min_learning_rate,
             distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
@@ -686,6 +746,8 @@ def train_distilled_model(
     gradient_checkpointing: bool = True,
     max_length: int = 1024,
     learning_rate: float = DEFAULT_TRAIN_LEARNING_RATE,
+    min_learning_rate: float = DEFAULT_TRAIN_MIN_LEARNING_RATE,
+    max_grad_norm: float = DEFAULT_TRAIN_MAX_GRAD_NORM,
     weight_decay: float = 0.0,
     distill_kl_vocab_chunk_size: int = DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE,
     checkpoint_every: int = 0,
@@ -704,8 +766,10 @@ def train_distilled_model(
     ood_route_weight: float = 0.0,
     ood_route_logit_bias: float = 0.0,
     route_logit_bias_anneal_steps: int = 0,
+    route_logit_bias_anneal_offset_steps: int = 0,
     route_logit_bias_anneal_loss_threshold: float = 5e-2,
     router_learning_rate: float = DEFAULT_ROUTER_LEARNING_RATE,
+    router_lr_warmup_steps: int = DEFAULT_ROUTER_LR_WARMUP_STEPS,
     router_lr_anneal_steps: int = DEFAULT_ROUTER_LR_ANNEAL_STEPS,
     router_min_learning_rate: float = DEFAULT_ROUTER_MIN_LEARNING_RATE,
     train_shared: bool = False,
@@ -741,14 +805,22 @@ def train_distilled_model(
         raise ValueError("--max-length must be at least 2")
     if learning_rate <= 0:
         raise ValueError("--learning-rate must be positive")
+    if min_learning_rate <= 0:
+        raise ValueError("--min-learning-rate must be positive")
+    if max_grad_norm < 0:
+        raise ValueError("--max-grad-norm cannot be negative")
     if ind_route_weight < 0 or ood_route_weight < 0:
         raise ValueError("--ind-route-weight and --ood-route-weight cannot be negative")
     if route_logit_bias_anneal_steps < 0:
         raise ValueError("--route-logit-bias-anneal-steps cannot be negative")
+    if route_logit_bias_anneal_offset_steps < 0:
+        raise ValueError("--route-logit-bias-anneal-offset-steps cannot be negative")
     if route_logit_bias_anneal_loss_threshold < 0:
         raise ValueError("--route-logit-bias-anneal-loss-threshold cannot be negative")
     if router_learning_rate <= 0:
         raise ValueError("--router-learning-rate must be positive")
+    if router_lr_warmup_steps < 0:
+        raise ValueError("--router-lr-warmup-steps cannot be negative")
     if router_lr_anneal_steps < 1:
         raise ValueError("--router-lr-anneal-steps must be at least 1")
     if router_min_learning_rate <= 0:
@@ -853,6 +925,8 @@ def train_distilled_model(
         gradient_checkpointing=gradient_checkpointing,
         max_length=max_length,
         learning_rate=learning_rate,
+        min_learning_rate=min_learning_rate,
+        max_grad_norm=max_grad_norm,
         weight_decay=weight_decay,
         distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
         checkpoint_every=checkpoint_every,
@@ -871,8 +945,10 @@ def train_distilled_model(
         ood_route_weight=ood_route_weight,
         ood_route_logit_bias=ood_route_logit_bias,
         route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
+        route_logit_bias_anneal_offset_steps=route_logit_bias_anneal_offset_steps,
         route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
         router_learning_rate=router_learning_rate,
+        router_lr_warmup_steps=router_lr_warmup_steps,
         router_lr_anneal_steps=router_lr_anneal_steps,
         router_min_learning_rate=router_min_learning_rate,
         parameter_selection=parameter_selection,
@@ -909,6 +985,7 @@ def train_distilled_model(
     route_bias_annealer = _RouteBiasAnnealer(
         anneal_steps=route_logit_bias_anneal_steps,
         loss_threshold=route_logit_bias_anneal_loss_threshold,
+        offset_steps=route_logit_bias_anneal_offset_steps,
     )
 
     tokenizer = None
@@ -965,6 +1042,7 @@ def train_distilled_model(
                 standard_trainable_parameters.append(parameter)
         if not masked_row_parameters and not standard_trainable_parameters and not router_trainable_parameters:
             raise ValueError("No trainable parameters were selected for training")
+        task_trainable_parameters = standard_trainable_parameters + masked_row_parameters
         optimizer_param_groups = _build_optimizer_param_groups(
             standard_trainable_parameters=standard_trainable_parameters,
             router_trainable_parameters=router_trainable_parameters,
@@ -985,7 +1063,7 @@ def train_distilled_model(
             lr_group="main",
             warmup_steps=lr_warmup_steps,
             total_steps=resolved_steps,
-            min_learning_rate=MIN_TRAIN_LEARNING_RATE,
+            min_learning_rate=min_learning_rate,
             base_learning_rate=learning_rate,
             torch_module=torch,
         )
@@ -994,8 +1072,8 @@ def train_distilled_model(
             router_lr_scheduler = _build_learning_rate_scheduler(
                 optimizer=optimizer,
                 lr_group="router",
-                warmup_steps=0,
-                total_steps=router_lr_anneal_steps,
+                warmup_steps=router_lr_warmup_steps,
+                total_steps=router_lr_warmup_steps + router_lr_anneal_steps,
                 min_learning_rate=router_min_learning_rate,
                 base_learning_rate=router_learning_rate,
                 torch_module=torch,
@@ -1042,6 +1120,9 @@ def train_distilled_model(
                 "lm_loss": 0.0,
                 "distill_loss": 0.0,
                 "route_loss": 0.0,
+                "weighted_lm_loss": 0.0,
+                "weighted_distill_loss": 0.0,
+                "weighted_route_loss": 0.0,
             }
             timing_metrics = {
                 "data_s": 0.0,
@@ -1064,6 +1145,9 @@ def train_distilled_model(
                     "lm_loss": 0.0,
                     "distill_loss": 0.0,
                     "route_loss": 0.0,
+                    "weighted_lm_loss": 0.0,
+                    "weighted_distill_loss": 0.0,
+                    "weighted_route_loss": 0.0,
                 },
                 "ood": {
                     "batches": 0,
@@ -1072,6 +1156,9 @@ def train_distilled_model(
                     "lm_loss": 0.0,
                     "distill_loss": 0.0,
                     "route_loss": 0.0,
+                    "weighted_lm_loss": 0.0,
+                    "weighted_distill_loss": 0.0,
+                    "weighted_route_loss": 0.0,
                 },
             }
             if router_metric_collector is not None:
@@ -1106,6 +1193,7 @@ def train_distilled_model(
                 lm_loss = None
                 distill_loss = None
                 route_loss = None
+                weighted_route_loss = None
                 total_loss = None
                 try:
                     t0 = time.perf_counter()
@@ -1174,30 +1262,55 @@ def train_distilled_model(
                     if route_loss is None:
                         route_loss = student_logits.new_zeros(())
                     task_loss = weights.lm * lm_loss + weights.distill * distill_loss
-                    total_loss = task_loss + weights.route * route_loss
+                    weighted_route_loss = weights.route * route_loss
+                    total_loss = task_loss + weighted_route_loss
                     t0 = time.perf_counter()
-                    (total_loss / gradient_accumulation_steps).backward()
+                    has_route_backward = _loss_requires_grad(weighted_route_loss) and bool(router_trainable_parameters)
+                    _backward_loss_for_parameters(
+                        loss=task_loss,
+                        parameters=task_trainable_parameters,
+                        gradient_scale=1.0 / gradient_accumulation_steps,
+                        retain_graph=has_route_backward,
+                        torch_module=torch,
+                    )
+                    _backward_loss_for_parameters(
+                        loss=weighted_route_loss,
+                        parameters=router_trainable_parameters,
+                        gradient_scale=1.0 / gradient_accumulation_steps,
+                        retain_graph=False,
+                        torch_module=torch,
+                    )
                     timing_metrics["backward_s"] += time.perf_counter() - t0
                     total_loss_value = float(total_loss.detach().cpu())
                     task_loss_value = float(task_loss.detach().cpu())
                     lm_loss_value = float(lm_loss.detach().cpu())
                     distill_loss_value = float(distill_loss.detach().cpu())
                     route_loss_value = float(route_loss.detach().cpu())
+                    weighted_lm_loss_value = weights.lm * lm_loss_value
+                    weighted_distill_loss_value = weights.distill * distill_loss_value
+                    weighted_route_loss_value = weights.route * route_loss_value
                     step_metrics["loss"] += total_loss_value
                     step_metrics["task_loss"] += task_loss_value
                     step_metrics["lm_loss"] += lm_loss_value
                     step_metrics["distill_loss"] += distill_loss_value
                     step_metrics["route_loss"] += route_loss_value
+                    step_metrics["weighted_lm_loss"] += weighted_lm_loss_value
+                    step_metrics["weighted_distill_loss"] += weighted_distill_loss_value
+                    step_metrics["weighted_route_loss"] += weighted_route_loss_value
                     language_metrics[language]["batches"] += 1
                     language_metrics[language]["loss"] += total_loss_value
                     language_metrics[language]["task_loss"] += task_loss_value
                     language_metrics[language]["lm_loss"] += lm_loss_value
                     language_metrics[language]["distill_loss"] += distill_loss_value
                     language_metrics[language]["route_loss"] += route_loss_value
+                    language_metrics[language]["weighted_lm_loss"] += weighted_lm_loss_value
+                    language_metrics[language]["weighted_distill_loss"] += weighted_distill_loss_value
+                    language_metrics[language]["weighted_route_loss"] += weighted_route_loss_value
                 finally:
                     if router_metric_collector is not None:
                         router_metric_collector.deactivate()
                     total_loss = None
+                    weighted_route_loss = None
                     task_loss = None
                     route_loss = None
                     distill_loss = None
@@ -1215,6 +1328,20 @@ def train_distilled_model(
                     timing_metrics["mps_cleanup_s"] += time.perf_counter() - t0
 
             t0 = time.perf_counter()
+            main_grad_norm = _parameter_grad_norm(task_trainable_parameters, torch_module=torch)
+            router_grad_norm = _parameter_grad_norm(router_trainable_parameters, torch_module=torch)
+            _clip_parameter_grad_norm(
+                task_trainable_parameters,
+                max_grad_norm=max_grad_norm,
+                torch_module=torch,
+            )
+            _clip_parameter_grad_norm(
+                router_trainable_parameters,
+                max_grad_norm=max_grad_norm,
+                torch_module=torch,
+            )
+            main_grad_norm_post_clip = _parameter_grad_norm(task_trainable_parameters, torch_module=torch)
+            router_grad_norm_post_clip = _parameter_grad_norm(router_trainable_parameters, torch_module=torch)
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
@@ -1233,10 +1360,12 @@ def train_distilled_model(
             ood_loss = _average_language_metric(language_metrics["ood"], "loss")
             router_metrics = router_metric_collector.averages() if router_metric_collector is not None else {}
             average_route_loss = step_metrics["route_loss"] / gradient_accumulation_steps
-            route_logit_bias_annealed = route_bias_annealer.observe_route_loss(average_route_loss)
+            average_weighted_route_loss = step_metrics["weighted_route_loss"] / gradient_accumulation_steps
+            route_logit_bias_annealed = route_bias_annealer.observe_route_loss(average_weighted_route_loss)
             postfix = {
                 "mix": mix_label,
-                "loss": f"{step_metrics['loss'] / gradient_accumulation_steps:.4f}",
+                "obj": f"{step_metrics['loss'] / gradient_accumulation_steps:.4f}",
+                "task": f"{step_metrics['task_loss'] / gradient_accumulation_steps:.4f}",
                 "route": f"{average_route_loss:.4f}",
                 "ind": _format_optional_metric(ind_loss),
                 "ood": _format_optional_metric(ood_loss),
@@ -1295,26 +1424,67 @@ def train_distilled_model(
                 "ind_batches": ind_batches,
                 "ood_batches": ood_batches,
                 "train_loss": step_metrics["loss"] / gradient_accumulation_steps,
+                "train_reported_objective": step_metrics["loss"] / gradient_accumulation_steps,
                 "train_task_loss": step_metrics["task_loss"] / gradient_accumulation_steps,
+                "train_task_objective": step_metrics["task_loss"] / gradient_accumulation_steps,
                 "train_lm_loss": step_metrics["lm_loss"] / gradient_accumulation_steps,
                 "train_distill_loss": step_metrics["distill_loss"] / gradient_accumulation_steps,
                 "train_route_loss": average_route_loss,
+                "train_router_objective": average_weighted_route_loss,
+                "train_weighted_lm_loss": step_metrics["weighted_lm_loss"] / gradient_accumulation_steps,
+                "train_weighted_distill_loss": step_metrics["weighted_distill_loss"] / gradient_accumulation_steps,
+                "train_weighted_route_loss": average_weighted_route_loss,
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "main_learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "min_learning_rate": min_learning_rate,
                 "router_learning_rate": current_router_learning_rate,
+                "router_lr_warmup_steps": router_lr_warmup_steps,
+                "max_grad_norm": max_grad_norm,
+                "main_grad_norm": main_grad_norm,
+                "router_grad_norm": router_grad_norm,
+                "main_grad_norm_pre_clip": main_grad_norm,
+                "router_grad_norm_pre_clip": router_grad_norm,
+                "main_grad_norm_post_clip": main_grad_norm_post_clip,
+                "router_grad_norm_post_clip": router_grad_norm_post_clip,
                 "ind_train_loss": ind_loss,
                 "ind_train_task_loss": _average_language_metric(language_metrics["ind"], "task_loss"),
+                "ind_train_task_objective": _average_language_metric(language_metrics["ind"], "task_loss"),
                 "ind_train_lm_loss": _average_language_metric(language_metrics["ind"], "lm_loss"),
                 "ind_train_distill_loss": _average_language_metric(language_metrics["ind"], "distill_loss"),
                 "ind_train_route_loss": _average_language_metric(language_metrics["ind"], "route_loss"),
+                "ind_train_router_objective": _average_language_metric(language_metrics["ind"], "weighted_route_loss"),
+                "ind_train_weighted_lm_loss": _average_language_metric(language_metrics["ind"], "weighted_lm_loss"),
+                "ind_train_weighted_distill_loss": _average_language_metric(
+                    language_metrics["ind"],
+                    "weighted_distill_loss",
+                ),
+                "ind_train_weighted_route_loss": _average_language_metric(
+                    language_metrics["ind"],
+                    "weighted_route_loss",
+                ),
                 "ood_train_loss": ood_loss,
                 "ood_train_task_loss": _average_language_metric(language_metrics["ood"], "task_loss"),
+                "ood_train_task_objective": _average_language_metric(language_metrics["ood"], "task_loss"),
                 "ood_train_lm_loss": _average_language_metric(language_metrics["ood"], "lm_loss"),
                 "ood_train_distill_loss": _average_language_metric(language_metrics["ood"], "distill_loss"),
                 "ood_train_route_loss": _average_language_metric(language_metrics["ood"], "route_loss"),
+                "ood_train_router_objective": _average_language_metric(language_metrics["ood"], "weighted_route_loss"),
+                "ood_train_weighted_lm_loss": _average_language_metric(language_metrics["ood"], "weighted_lm_loss"),
+                "ood_train_weighted_distill_loss": _average_language_metric(
+                    language_metrics["ood"],
+                    "weighted_distill_loss",
+                ),
+                "ood_train_weighted_route_loss": _average_language_metric(
+                    language_metrics["ood"],
+                    "weighted_route_loss",
+                ),
                 "eval_lm_loss": current_eval_loss,
                 "latest_eval_lm_loss": latest_eval_loss,
                 "route_logit_bias_scale": route_logit_bias_scale,
                 "route_logit_bias_anneal_progress": route_bias_annealer.completed_anneal_steps,
+                "route_logit_bias_anneal_observed_steps": route_bias_annealer.observed_steps,
+                "route_logit_bias_anneal_offset_steps": route_logit_bias_anneal_offset_steps,
+                "route_logit_bias_anneal_objective": average_weighted_route_loss,
                 "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
                 "route_logit_bias_annealed": route_logit_bias_annealed,
                 "ind_route_logit_bias": effective_ind_route_logit_bias,
@@ -1415,14 +1585,18 @@ def train_distilled_model(
             lr_warmup_steps=lr_warmup_steps,
             max_length=max_length,
             learning_rate=learning_rate,
+            min_learning_rate=min_learning_rate,
+            max_grad_norm=max_grad_norm,
             weight_decay=weight_decay,
             ind_route_weight=ind_route_weight,
             ind_route_logit_bias=ind_route_logit_bias,
             ood_route_weight=ood_route_weight,
             ood_route_logit_bias=ood_route_logit_bias,
             route_logit_bias_anneal_steps=route_logit_bias_anneal_steps,
+            route_logit_bias_anneal_offset_steps=route_logit_bias_anneal_offset_steps,
             route_logit_bias_anneal_loss_threshold=route_logit_bias_anneal_loss_threshold,
             router_learning_rate=router_learning_rate,
+            router_lr_warmup_steps=router_lr_warmup_steps,
             router_lr_anneal_steps=router_lr_anneal_steps,
             router_min_learning_rate=router_min_learning_rate,
             parameter_selection=parameter_selection,
@@ -1946,6 +2120,66 @@ def _optimizer_group_learning_rate(*, optimizer: Any, lr_group: str) -> float | 
         if group.get("lr_group") == lr_group:
             return float(group["lr"])
     return None
+
+
+def _loss_requires_grad(loss: Any) -> bool:
+    return bool(getattr(loss, "requires_grad", False))
+
+
+def _backward_loss_for_parameters(
+    *,
+    loss: Any,
+    parameters: list[Any],
+    gradient_scale: float,
+    retain_graph: bool,
+    torch_module: Any,
+) -> None:
+    if not parameters or not _loss_requires_grad(loss):
+        return
+    trainable_parameters = tuple(
+        parameter
+        for parameter in parameters
+        if bool(getattr(parameter, "requires_grad", False))
+    )
+    if not trainable_parameters:
+        return
+    torch_module.autograd.backward(
+        loss * gradient_scale,
+        retain_graph=retain_graph,
+        inputs=trainable_parameters,
+    )
+
+
+def _parameter_grad_norm(parameters: list[Any], *, torch_module: Any) -> float | None:
+    squared_norm = None
+    for parameter in parameters:
+        gradient = getattr(parameter, "grad", None)
+        if gradient is None:
+            continue
+        detached_gradient = gradient.detach()
+        contribution = detached_gradient.float().pow(2).sum()
+        squared_norm = contribution if squared_norm is None else squared_norm + contribution
+    if squared_norm is None:
+        return None
+    return float(torch_module.sqrt(squared_norm).cpu())
+
+
+def _clip_parameter_grad_norm(
+    parameters: list[Any],
+    *,
+    max_grad_norm: float,
+    torch_module: Any,
+) -> None:
+    if max_grad_norm <= 0 or not parameters:
+        return
+    trainable_parameters = [
+        parameter
+        for parameter in parameters
+        if bool(getattr(parameter, "requires_grad", False)) and getattr(parameter, "grad", None) is not None
+    ]
+    if not trainable_parameters:
+        return
+    torch_module.nn.utils.clip_grad_norm_(trainable_parameters, max_norm=max_grad_norm)
 
 
 def _build_row_mask(
@@ -2496,6 +2730,8 @@ def _build_training_configuration_state(
     gradient_checkpointing: bool,
     max_length: int,
     learning_rate: float,
+    min_learning_rate: float,
+    max_grad_norm: float,
     weight_decay: float,
     distill_kl_vocab_chunk_size: int,
     checkpoint_every: int,
@@ -2514,8 +2750,10 @@ def _build_training_configuration_state(
     ood_route_weight: float,
     ood_route_logit_bias: float,
     route_logit_bias_anneal_steps: int,
+    route_logit_bias_anneal_offset_steps: int,
     route_logit_bias_anneal_loss_threshold: float,
     router_learning_rate: float,
+    router_lr_warmup_steps: int,
     router_lr_anneal_steps: int,
     router_min_learning_rate: float,
     parameter_selection: TrainingParameterSelection,
@@ -2545,8 +2783,9 @@ def _build_training_configuration_state(
         "gradient_checkpointing": gradient_checkpointing,
         "max_length": max_length,
         "learning_rate": learning_rate,
-        "min_learning_rate": MIN_TRAIN_LEARNING_RATE,
+        "min_learning_rate": min_learning_rate,
         "learning_rate_schedule": "linear_warmup_cosine_decay",
+        "max_grad_norm": max_grad_norm,
         "weight_decay": weight_decay,
         "distill_kl_vocab_chunk_size": distill_kl_vocab_chunk_size,
         "checkpoint_every": checkpoint_every,
@@ -2569,8 +2808,10 @@ def _build_training_configuration_state(
         },
         "ood_route_logit_bias": ood_route_logit_bias,
         "route_logit_bias_anneal_steps": route_logit_bias_anneal_steps,
+        "route_logit_bias_anneal_offset_steps": route_logit_bias_anneal_offset_steps,
         "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
         "router_learning_rate": router_learning_rate,
+        "router_lr_warmup_steps": router_lr_warmup_steps,
         "router_lr_anneal_steps": router_lr_anneal_steps,
         "router_min_learning_rate": router_min_learning_rate,
         "parameter_selection": asdict(parameter_selection),
@@ -2746,14 +2987,18 @@ def _write_training_recipe(
     distill_every: int,
     max_length: int,
     learning_rate: float,
+    min_learning_rate: float,
+    max_grad_norm: float,
     weight_decay: float,
     ind_route_weight: float,
     ind_route_logit_bias: float,
     ood_route_weight: float,
     ood_route_logit_bias: float,
     route_logit_bias_anneal_steps: int,
+    route_logit_bias_anneal_offset_steps: int,
     route_logit_bias_anneal_loss_threshold: float,
     router_learning_rate: float,
+    router_lr_warmup_steps: int,
     router_lr_anneal_steps: int,
     router_min_learning_rate: float,
     parameter_selection: TrainingParameterSelection,
@@ -2799,16 +3044,19 @@ def _write_training_recipe(
         "distill_every": distill_every,
         "max_length": max_length,
         "learning_rate": learning_rate,
-        "min_learning_rate": MIN_TRAIN_LEARNING_RATE,
+        "min_learning_rate": min_learning_rate,
         "learning_rate_schedule": "linear_warmup_cosine_decay",
+        "max_grad_norm": max_grad_norm,
         "weight_decay": weight_decay,
         "ind_route_weight": ind_route_weight,
         "ind_route_logit_bias": ind_route_logit_bias,
         "ood_route_weight": ood_route_weight,
         "ood_route_logit_bias": ood_route_logit_bias,
         "route_logit_bias_anneal_steps": route_logit_bias_anneal_steps,
+        "route_logit_bias_anneal_offset_steps": route_logit_bias_anneal_offset_steps,
         "route_logit_bias_anneal_loss_threshold": route_logit_bias_anneal_loss_threshold,
         "router_learning_rate": router_learning_rate,
+        "router_lr_warmup_steps": router_lr_warmup_steps,
         "router_lr_anneal_steps": router_lr_anneal_steps,
         "router_min_learning_rate": router_min_learning_rate,
         "parameter_selection": asdict(parameter_selection),
@@ -3003,10 +3251,11 @@ def _format_optional_seconds(value: float | None) -> str:
 
 
 def _print_training_metrics(record: dict[str, Any]) -> None:
+    reported_objective = record.get("train_reported_objective", record["train_loss"])
     parts = [
         f"step={record['step']}",
         f"mix={record['mix']}",
-        f"train_loss={record['train_loss']:.4f}",
+        f"train_objective={reported_objective:.4f}",
         f"train_lm_loss={record['train_lm_loss']:.4f}",
         f"train_distill_loss={record['train_distill_loss']:.4f}",
         f"ind_train_loss={_format_optional_metric(record.get('ind_train_loss'))}",
@@ -3018,12 +3267,27 @@ def _print_training_metrics(record: dict[str, Any]) -> None:
     route_loss = record.get("train_route_loss")
     if isinstance(route_loss, float):
         parts.insert(5, f"train_route_loss={route_loss:.4f}")
+    router_objective = record.get("train_router_objective")
+    if isinstance(router_objective, float):
+        parts.insert(6, f"train_router_objective={router_objective:.4f}")
     learning_rate = record.get("learning_rate")
     if isinstance(learning_rate, float):
-        parts.insert(5, f"lr={learning_rate:.2e}")
+        parts.insert(7, f"main_lr={learning_rate:.2e}")
     router_learning_rate = record.get("router_learning_rate")
     if isinstance(router_learning_rate, float):
-        parts.insert(6, f"router_lr={router_learning_rate:.2e}")
+        parts.insert(8, f"router_lr={router_learning_rate:.2e}")
+    main_grad_norm_pre_clip = record.get("main_grad_norm_pre_clip", record.get("main_grad_norm"))
+    if isinstance(main_grad_norm_pre_clip, float):
+        parts.append(f"main_grad_pre={main_grad_norm_pre_clip:.4e}")
+    main_grad_norm_post_clip = record.get("main_grad_norm_post_clip")
+    if isinstance(main_grad_norm_post_clip, float):
+        parts.append(f"main_grad_clip={main_grad_norm_post_clip:.4e}")
+    router_grad_norm_pre_clip = record.get("router_grad_norm_pre_clip", record.get("router_grad_norm"))
+    if isinstance(router_grad_norm_pre_clip, float):
+        parts.append(f"router_grad_pre={router_grad_norm_pre_clip:.4e}")
+    router_grad_norm_post_clip = record.get("router_grad_norm_post_clip")
+    if isinstance(router_grad_norm_post_clip, float):
+        parts.append(f"router_grad_clip={router_grad_norm_post_clip:.4e}")
     step_total_s = record.get("step_total_s")
     if isinstance(step_total_s, float):
         parts.append(f"step_s={_format_optional_seconds(step_total_s)}")
@@ -3215,6 +3479,10 @@ __all__ = [
     "DEFAULT_LOG_EVERY",
     "DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE",
     "DEFAULT_PRINT_EVERY",
+    "DEFAULT_ROUTER_LEARNING_RATE",
+    "DEFAULT_ROUTER_LR_ANNEAL_STEPS",
+    "DEFAULT_ROUTER_LR_WARMUP_STEPS",
+    "DEFAULT_ROUTER_MIN_LEARNING_RATE",
     "DEFAULT_TRAIN_BATCH_SIZE",
     "DEFAULT_TRAIN_DTYPE",
     "DEFAULT_TRAIN_EVAL_EVERY",
@@ -3222,6 +3490,8 @@ __all__ = [
     "DEFAULT_TRAIN_GRADIENT_ACCUMULATION_STEPS",
     "DEFAULT_TRAIN_LEARNING_RATE",
     "DEFAULT_TRAIN_LR_WARMUP_STEPS",
+    "DEFAULT_TRAIN_MAX_GRAD_NORM",
+    "DEFAULT_TRAIN_MIN_LEARNING_RATE",
     "DEFAULT_TRAIN_STEPS",
     "DEFAULT_TRAIN_TORCH_COMPILE",
     "DEFAULT_WEIGHT_DIFF_EVERY",
