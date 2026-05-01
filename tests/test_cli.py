@@ -766,6 +766,7 @@ def test_train_command_invokes_distillation_training(
         max_length: int,
         learning_rate: float,
         min_learning_rate: float,
+        frozen_learning_rate: float,
         router_learning_rate: float,
         router_lr_warmup_steps: int,
         router_lr_anneal_steps: int,
@@ -817,6 +818,7 @@ def test_train_command_invokes_distillation_training(
         assert max_length == 512
         assert learning_rate == 2e-4
         assert min_learning_rate == 2e-7
+        assert frozen_learning_rate == 1e-8
         assert router_learning_rate == 0.002
         assert router_lr_warmup_steps == 11
         assert router_lr_anneal_steps == 75
@@ -880,6 +882,8 @@ def test_train_command_invokes_distillation_training(
             "2e-4",
             "--min-learning-rate",
             "2e-7",
+            "--frozen-learning-rate",
+            "1e-8",
             "--router-learning-rate",
             "2e-3",
             "--router-lr-warmup-steps",
@@ -971,6 +975,7 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "gradient_checkpointing": True,
                 "learning_rate": 5e-5,
                 "min_learning_rate": 1e-8,
+                "frozen_learning_rate": 0.0,
                 "max_grad_norm": 10.0,
                 "router_learning_rate": 1e-3,
                 "router_lr_warmup_steps": 0,
@@ -1035,6 +1040,7 @@ def test_train_command_dry_run_prints_report_and_skips_training(
     assert dry_run_payload["dry_run"]["gradient_checkpointing"] is True
     assert dry_run_payload["dry_run"]["combined_loss"] is False
     assert dry_run_payload["dry_run"]["min_learning_rate"] == 1e-8
+    assert dry_run_payload["dry_run"]["frozen_learning_rate"] == 0.0
     assert dry_run_payload["dry_run"]["router_learning_rate"] == 1e-3
     assert dry_run_payload["dry_run"]["router_lr_warmup_steps"] == 0
     assert dry_run_payload["dry_run"]["router_lr_anneal_steps"] == 100

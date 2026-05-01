@@ -12,6 +12,7 @@ import torch
 
 from tokcleanse.train import (
     _CorpusStream,
+    _FrozenGradientScale,
     _LanguageScheduler,
     _RouteBiasAnnealer,
     _backward_loss_for_parameters,
@@ -362,6 +363,46 @@ def test_prepare_student_for_distillation_can_train_full_embedding_lm_head() -> 
     assert torch.all(named_parameters["lm_head.weight"].grad == 1)
 
 
+def test_prepare_student_for_distillation_can_train_frozen_rows_with_tiny_gradient_scale() -> None:
+    model = _DummyModel()
+    token_groups = TokenGroupMetadata(
+        original_token_ids=(0, 2, 4, 5),
+        added_token_ids=(1, 3),
+        requested_added_token_ids=(3,),
+        intermediate_added_token_ids=(1,),
+        special_token_ids=(0,),
+        added_tokens=("yz", "ayz"),
+        requested_added_tokens=("ayz",),
+        intermediate_added_tokens=("yz",),
+        special_tokens=("<pad>",),
+    )
+    frozen_gradient_scale = _FrozenGradientScale(value=0.25)
+
+    prepare_student_for_distillation(
+        model,
+        token_groups=token_groups,
+        torch_module=torch,
+        frozen_gradient_scale=frozen_gradient_scale,
+    )
+
+    loss = (
+        model.model.embed_tokens.weight.sum()
+        + model.lm_head.weight.sum()
+        + model.model.layers[0].experts.gate_up_proj.sum()
+        + model.model.layers[0].experts.down_proj.sum()
+        + model.model.layers[0].self_attn.weight.sum()
+    )
+    loss.backward()
+
+    embedding_grad_rows = model.model.embed_tokens.weight.grad.abs().sum(dim=1).tolist()
+    lm_head_grad_rows = model.lm_head.weight.grad.abs().sum(dim=1).tolist()
+    assert embedding_grad_rows == [1.0, 4.0, 1.0, 4.0, 1.0, 1.0]
+    assert lm_head_grad_rows == [1.0, 4.0, 1.0, 4.0, 1.0, 1.0]
+    assert torch.all(model.model.layers[0].experts.gate_up_proj.grad[0] == 0.25)
+    assert torch.all(model.model.layers[0].experts.gate_up_proj.grad[1] == 1.0)
+    assert torch.all(model.model.layers[0].self_attn.weight.grad == 1.0)
+
+
 def test_compute_expert_pair_weight_diff_metrics() -> None:
     model = _DummyModel()
     with torch.no_grad():
@@ -705,6 +746,7 @@ def test_build_training_dry_run_report_lists_trainable_parameters(
     assert report.combined_loss is False
     assert report.lr_warmup_steps == 0
     assert report.min_learning_rate == pytest.approx(1e-8)
+    assert report.frozen_learning_rate == 0.0
     assert report.router_lr_warmup_steps == 0
     assert "model.embed_tokens.weight" in report.masked_row_parameter_names
     assert "lm_head.weight" in report.masked_row_parameter_names
@@ -942,6 +984,7 @@ def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: 
         max_length=256,
         learning_rate=1e-3,
         min_learning_rate=1e-8,
+        frozen_learning_rate=0.0,
         max_grad_norm=10.0,
         weight_decay=0.0,
         distill_kl_vocab_chunk_size=0,

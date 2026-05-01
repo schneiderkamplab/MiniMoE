@@ -115,6 +115,7 @@ class TrainingDryRunReport:
     gradient_checkpointing: bool
     learning_rate: float
     min_learning_rate: float
+    frozen_learning_rate: float
     max_grad_norm: float
     weight_decay: float
     ind_route_weight: float
@@ -157,6 +158,11 @@ class _RouterRoutingMetrics:
     unbiased_probability_sum: float = 0.0
     weight_sum: float = 0.0
     token_layer_count: int = 0
+
+
+@dataclass(slots=True)
+class _FrozenGradientScale:
+    value: float = 0.0
 
 
 @dataclass(slots=True)
@@ -328,10 +334,12 @@ def prepare_student_for_distillation(
     token_groups: TokenGroupMetadata,
     torch_module: Any,
     parameter_selection: TrainingParameterSelection = TrainingParameterSelection(),
+    frozen_gradient_scale: _FrozenGradientScale | None = None,
 ) -> None:
     """Freeze the shared backbone and leave MoE-specific plus added rows trainable."""
 
     masked_row_parameter_ids = _masked_row_parameter_ids(model)
+    train_frozen_parameters = frozen_gradient_scale is not None
     for _, parameter in model.named_parameters():
         parameter.requires_grad_(False)
 
@@ -339,7 +347,7 @@ def prepare_student_for_distillation(
         if id(parameter) in masked_row_parameter_ids:
             continue
         if _is_expert_weight_parameter(name):
-            if parameter_selection.expert_0 or parameter_selection.expert_1:
+            if parameter_selection.expert_0 or parameter_selection.expert_1 or train_frozen_parameters:
                 parameter.requires_grad_(True)
                 _mask_frozen_expert_gradients(
                     name=name,
@@ -347,10 +355,11 @@ def prepare_student_for_distillation(
                     torch_module=torch_module,
                     train_expert_0=parameter_selection.expert_0,
                     train_expert_1=parameter_selection.expert_1,
+                    frozen_gradient_scale=frozen_gradient_scale,
                 )
         elif _is_router_parameter(name):
             parameter.requires_grad_(True)
-        elif parameter_selection.shared:
+        elif parameter_selection.shared or train_frozen_parameters:
             parameter.requires_grad_(True)
 
     if parameter_selection.embedding_lm_head and parameter_selection.full_embedding_lm_head:
@@ -360,7 +369,10 @@ def prepare_student_for_distillation(
             model=model,
             token_ids=token_groups.added_token_ids,
             torch_module=torch_module,
+            frozen_gradient_scale=frozen_gradient_scale,
         )
+    elif train_frozen_parameters:
+        _enable_all_embedding_lm_head(model=model)
 
 
 class _RouterRoutingMetricCollector:
@@ -510,6 +522,7 @@ def build_training_dry_run_report(
     gradient_checkpointing: bool = True,
     learning_rate: float = DEFAULT_TRAIN_LEARNING_RATE,
     min_learning_rate: float = DEFAULT_TRAIN_MIN_LEARNING_RATE,
+    frozen_learning_rate: float = 0.0,
     max_grad_norm: float = DEFAULT_TRAIN_MAX_GRAD_NORM,
     weight_decay: float = 0.0,
     distill_kl_vocab_chunk_size: int = DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE,
@@ -557,6 +570,8 @@ def build_training_dry_run_report(
         raise ValueError("--learning-rate must be positive")
     if min_learning_rate <= 0:
         raise ValueError("--min-learning-rate must be positive")
+    if frozen_learning_rate < 0:
+        raise ValueError("--frozen-learning-rate cannot be negative")
     if max_grad_norm < 0:
         raise ValueError("--max-grad-norm cannot be negative")
     if ind_route_weight < 0 or ood_route_weight < 0:
@@ -637,12 +652,14 @@ def build_training_dry_run_report(
             token_groups=token_groups,
             torch_module=torch,
             parameter_selection=parameter_selection,
+            frozen_gradient_scale=_FrozenGradientScale() if frozen_learning_rate > 0 else None,
         )
         masked_row_parameter_ids = _masked_row_parameter_ids(model)
         masked_row_parameter_names: list[str] = []
         masked_row_parameters: list[Any] = []
         router_trainable_parameters: list[Any] = []
         standard_trainable_parameters: list[Any] = []
+        frozen_trainable_parameters: list[Any] = []
         trainable_parameter_names: list[str] = []
         for name, parameter in model.named_parameters():
             if not parameter.requires_grad:
@@ -650,6 +667,13 @@ def build_training_dry_run_report(
             trainable_parameter_names.append(name)
             if ".router." in name:
                 router_trainable_parameters.append(parameter)
+            elif _parameter_uses_frozen_learning_rate(
+                name=name,
+                parameter=parameter,
+                masked_row_parameter_ids=masked_row_parameter_ids,
+                parameter_selection=parameter_selection,
+            ):
+                frozen_trainable_parameters.append(parameter)
             elif id(parameter) in masked_row_parameter_ids:
                 masked_row_parameter_names.append(name)
                 masked_row_parameters.append(parameter)
@@ -659,10 +683,12 @@ def build_training_dry_run_report(
             standard_trainable_parameters=standard_trainable_parameters,
             router_trainable_parameters=router_trainable_parameters,
             masked_row_parameters=masked_row_parameters,
+            frozen_trainable_parameters=frozen_trainable_parameters,
             named_parameters=dict(model.named_parameters()),
             weight_decay=weight_decay,
             learning_rate=learning_rate,
             router_learning_rate=router_learning_rate,
+            frozen_learning_rate=frozen_learning_rate,
         )
         return TrainingDryRunReport(
             resolved_device=resolved_device,
@@ -688,6 +714,7 @@ def build_training_dry_run_report(
             gradient_checkpointing=gradient_checkpointing,
             learning_rate=learning_rate,
             min_learning_rate=min_learning_rate,
+            frozen_learning_rate=frozen_learning_rate,
             max_grad_norm=max_grad_norm,
             weight_decay=weight_decay,
             ind_route_weight=ind_route_weight,
@@ -751,6 +778,7 @@ def train_distilled_model(
     max_length: int = 1024,
     learning_rate: float = DEFAULT_TRAIN_LEARNING_RATE,
     min_learning_rate: float = DEFAULT_TRAIN_MIN_LEARNING_RATE,
+    frozen_learning_rate: float = 0.0,
     max_grad_norm: float = DEFAULT_TRAIN_MAX_GRAD_NORM,
     weight_decay: float = 0.0,
     distill_kl_vocab_chunk_size: int = DEFAULT_DISTILL_KL_VOCAB_CHUNK_SIZE,
@@ -811,6 +839,8 @@ def train_distilled_model(
         raise ValueError("--learning-rate must be positive")
     if min_learning_rate <= 0:
         raise ValueError("--min-learning-rate must be positive")
+    if frozen_learning_rate < 0:
+        raise ValueError("--frozen-learning-rate cannot be negative")
     if max_grad_norm < 0:
         raise ValueError("--max-grad-norm cannot be negative")
     if ind_route_weight < 0 or ood_route_weight < 0:
@@ -931,6 +961,7 @@ def train_distilled_model(
         max_length=max_length,
         learning_rate=learning_rate,
         min_learning_rate=min_learning_rate,
+        frozen_learning_rate=frozen_learning_rate,
         max_grad_norm=max_grad_norm,
         weight_decay=weight_decay,
         distill_kl_vocab_chunk_size=distill_kl_vocab_chunk_size,
@@ -1024,11 +1055,13 @@ def train_distilled_model(
         if teacher is not None:
             teacher.to(resolved_device)
             teacher.eval()
+        frozen_gradient_scale = _FrozenGradientScale() if frozen_learning_rate > 0 else None
         prepare_student_for_distillation(
             student,
             token_groups=token_groups,
             torch_module=torch,
             parameter_selection=parameter_selection,
+            frozen_gradient_scale=frozen_gradient_scale,
         )
         student.train()
 
@@ -1036,25 +1069,40 @@ def train_distilled_model(
         masked_row_parameters = []
         router_trainable_parameters = []
         standard_trainable_parameters = []
+        frozen_trainable_parameters = []
         for name, parameter in student.named_parameters():
             if not parameter.requires_grad:
                 continue
             if ".router." in name:
                 router_trainable_parameters.append(parameter)
+            elif _parameter_uses_frozen_learning_rate(
+                name=name,
+                parameter=parameter,
+                masked_row_parameter_ids=masked_row_parameter_ids,
+                parameter_selection=parameter_selection,
+            ):
+                frozen_trainable_parameters.append(parameter)
             elif id(parameter) in masked_row_parameter_ids:
                 masked_row_parameters.append(parameter)
             else:
                 standard_trainable_parameters.append(parameter)
-        if not masked_row_parameters and not standard_trainable_parameters and not router_trainable_parameters:
+        if (
+            not masked_row_parameters
+            and not standard_trainable_parameters
+            and not router_trainable_parameters
+            and not frozen_trainable_parameters
+        ):
             raise ValueError("No trainable parameters were selected for training")
-        task_trainable_parameters = standard_trainable_parameters + masked_row_parameters
+        task_trainable_parameters = standard_trainable_parameters + masked_row_parameters + frozen_trainable_parameters
         optimizer_param_groups = _build_optimizer_param_groups(
             standard_trainable_parameters=standard_trainable_parameters,
             router_trainable_parameters=router_trainable_parameters,
             masked_row_parameters=masked_row_parameters,
+            frozen_trainable_parameters=frozen_trainable_parameters,
             weight_decay=weight_decay,
             learning_rate=learning_rate,
             router_learning_rate=router_learning_rate,
+            frozen_learning_rate=frozen_learning_rate,
         )
         optimizer = torch.optim.AdamW(
             optimizer_param_groups,
@@ -1090,6 +1138,7 @@ def train_distilled_model(
             learning_rates_by_group={
                 "main": learning_rate,
                 "router": router_learning_rate,
+                "frozen": frozen_learning_rate,
             },
             lr_scheduler=lr_scheduler,
             router_lr_scheduler=router_lr_scheduler,
@@ -1270,6 +1319,11 @@ def train_distilled_model(
                     weighted_route_loss = weights.route * route_loss
                     total_loss = task_loss + weighted_route_loss
                     t0 = time.perf_counter()
+                    if frozen_gradient_scale is not None:
+                        frozen_gradient_scale.value = _frozen_gradient_scale_value(
+                            frozen_learning_rate=frozen_learning_rate,
+                            current_learning_rate=float(optimizer.param_groups[0]["lr"]),
+                        )
                     task_backward_loss = total_loss if combined_loss else task_loss
                     router_backward_loss = total_loss if combined_loss else weighted_route_loss
                     has_route_backward = _loss_requires_grad(router_backward_loss) and bool(router_trainable_parameters)
@@ -1447,6 +1501,8 @@ def train_distilled_model(
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "main_learning_rate": float(optimizer.param_groups[0]["lr"]),
                 "min_learning_rate": min_learning_rate,
+                "frozen_learning_rate": frozen_learning_rate,
+                "frozen_gradient_scale": None if frozen_gradient_scale is None else frozen_gradient_scale.value,
                 "router_learning_rate": current_router_learning_rate,
                 "router_lr_warmup_steps": router_lr_warmup_steps,
                 "max_grad_norm": max_grad_norm,
@@ -1596,6 +1652,7 @@ def train_distilled_model(
             max_length=max_length,
             learning_rate=learning_rate,
             min_learning_rate=min_learning_rate,
+            frozen_learning_rate=frozen_learning_rate,
             max_grad_norm=max_grad_norm,
             weight_decay=weight_decay,
             ind_route_weight=ind_route_weight,
@@ -1983,6 +2040,7 @@ def _mask_frozen_expert_gradients(
     torch_module: Any,
     train_expert_0: bool,
     train_expert_1: bool,
+    frozen_gradient_scale: _FrozenGradientScale | None,
 ) -> None:
     if not _is_expert_weight_parameter(name):
         return
@@ -1993,7 +2051,13 @@ def _mask_frozen_expert_gradients(
         mask[0] = 1
     if train_expert_1:
         mask[1] = 1
-    parameter.register_hook(lambda grad, expert_mask=mask: grad * expert_mask.to(dtype=grad.dtype))
+    parameter.register_hook(
+        lambda grad, expert_mask=mask, scale=frozen_gradient_scale: _apply_trainable_frozen_gradient_mask(
+            grad=grad,
+            mask=expert_mask,
+            frozen_gradient_scale=scale,
+        )
+    )
 
 
 def _enable_added_token_rows(
@@ -2001,8 +2065,9 @@ def _enable_added_token_rows(
     model: Any,
     token_ids: tuple[int, ...],
     torch_module: Any,
+    frozen_gradient_scale: _FrozenGradientScale | None,
 ) -> None:
-    if not token_ids:
+    if not token_ids and frozen_gradient_scale is None:
         return
     handled_parameter_ids: set[int] = set()
     input_embeddings = model.get_input_embeddings()
@@ -2022,7 +2087,13 @@ def _enable_added_token_rows(
             torch_module=torch_module,
             device=parameter.device,
         )
-        parameter.register_hook(lambda grad, row_mask=mask: grad * row_mask.to(dtype=grad.dtype))
+        parameter.register_hook(
+            lambda grad, row_mask=mask, scale=frozen_gradient_scale: _apply_trainable_frozen_gradient_mask(
+                grad=grad,
+                mask=row_mask,
+                frozen_gradient_scale=scale,
+            )
+        )
 
 
 def _enable_all_embedding_lm_head(*, model: Any) -> None:
@@ -2040,6 +2111,18 @@ def _enable_all_embedding_lm_head(*, model: Any) -> None:
         parameter.requires_grad_(True)
 
 
+def _apply_trainable_frozen_gradient_mask(
+    *,
+    grad: Any,
+    mask: Any,
+    frozen_gradient_scale: _FrozenGradientScale | None,
+) -> Any:
+    grad_mask = mask.to(dtype=grad.dtype)
+    if frozen_gradient_scale is None:
+        return grad * grad_mask
+    return grad * (grad_mask + (1.0 - grad_mask) * frozen_gradient_scale.value)
+
+
 def _masked_row_parameter_ids(model: Any) -> frozenset[int]:
     parameter_ids: set[int] = set()
     for module in (model.get_input_embeddings(), model.get_output_embeddings()):
@@ -2049,14 +2132,42 @@ def _masked_row_parameter_ids(model: Any) -> frozenset[int]:
     return frozenset(parameter_ids)
 
 
+def _parameter_uses_frozen_learning_rate(
+    *,
+    name: str,
+    parameter: Any,
+    masked_row_parameter_ids: frozenset[int],
+    parameter_selection: TrainingParameterSelection,
+) -> bool:
+    if _is_router_parameter(name):
+        return False
+    if id(parameter) in masked_row_parameter_ids:
+        return not parameter_selection.embedding_lm_head
+    if _is_expert_weight_parameter(name):
+        return not (parameter_selection.expert_0 or parameter_selection.expert_1)
+    return not parameter_selection.shared
+
+
+def _frozen_gradient_scale_value(
+    *,
+    frozen_learning_rate: float,
+    current_learning_rate: float,
+) -> float:
+    if frozen_learning_rate <= 0 or current_learning_rate <= 0:
+        return 0.0
+    return frozen_learning_rate / current_learning_rate
+
+
 def _build_optimizer_param_groups(
     *,
     standard_trainable_parameters: list[Any],
     router_trainable_parameters: list[Any],
     masked_row_parameters: list[Any],
+    frozen_trainable_parameters: list[Any],
     weight_decay: float,
     learning_rate: float,
     router_learning_rate: float,
+    frozen_learning_rate: float,
 ) -> list[dict[str, Any]]:
     optimizer_param_groups: list[dict[str, Any]] = []
     if standard_trainable_parameters:
@@ -2088,6 +2199,15 @@ def _build_optimizer_param_groups(
                 "lr_group": "main",
             }
         )
+    if frozen_trainable_parameters:
+        optimizer_param_groups.append(
+            {
+                "params": frozen_trainable_parameters,
+                "weight_decay": weight_decay,
+                "lr": frozen_learning_rate,
+                "lr_group": "frozen",
+            }
+        )
     return optimizer_param_groups
 
 
@@ -2096,19 +2216,23 @@ def _serialize_optimizer_groups(
     standard_trainable_parameters: list[Any],
     router_trainable_parameters: list[Any],
     masked_row_parameters: list[Any],
+    frozen_trainable_parameters: list[Any],
     named_parameters: dict[str, Any],
     weight_decay: float,
     learning_rate: float,
     router_learning_rate: float,
+    frozen_learning_rate: float,
 ) -> tuple[dict[str, Any], ...]:
     parameter_name_by_id = {id(parameter): name for name, parameter in named_parameters.items()}
     groups = _build_optimizer_param_groups(
         standard_trainable_parameters=standard_trainable_parameters,
         router_trainable_parameters=router_trainable_parameters,
         masked_row_parameters=masked_row_parameters,
+        frozen_trainable_parameters=frozen_trainable_parameters,
         weight_decay=weight_decay,
         learning_rate=learning_rate,
         router_learning_rate=router_learning_rate,
+        frozen_learning_rate=frozen_learning_rate,
     )
     serialized_groups = []
     for group in groups:
@@ -2743,6 +2867,7 @@ def _build_training_configuration_state(
     max_length: int,
     learning_rate: float,
     min_learning_rate: float,
+    frozen_learning_rate: float,
     max_grad_norm: float,
     weight_decay: float,
     distill_kl_vocab_chunk_size: int,
@@ -2797,6 +2922,7 @@ def _build_training_configuration_state(
         "max_length": max_length,
         "learning_rate": learning_rate,
         "min_learning_rate": min_learning_rate,
+        "frozen_learning_rate": frozen_learning_rate,
         "learning_rate_schedule": "linear_warmup_cosine_decay",
         "max_grad_norm": max_grad_norm,
         "weight_decay": weight_decay,
@@ -3002,6 +3128,7 @@ def _write_training_recipe(
     max_length: int,
     learning_rate: float,
     min_learning_rate: float,
+    frozen_learning_rate: float,
     max_grad_norm: float,
     weight_decay: float,
     ind_route_weight: float,
@@ -3060,6 +3187,7 @@ def _write_training_recipe(
         "max_length": max_length,
         "learning_rate": learning_rate,
         "min_learning_rate": min_learning_rate,
+        "frozen_learning_rate": frozen_learning_rate,
         "learning_rate_schedule": "linear_warmup_cosine_decay",
         "max_grad_norm": max_grad_norm,
         "weight_decay": weight_decay,
