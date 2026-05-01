@@ -765,7 +765,9 @@ def test_train_command_invokes_distillation_training(
         gradient_checkpointing: bool,
         max_length: int,
         learning_rate: float,
+        min_learning_rate: float,
         router_learning_rate: float,
+        router_lr_warmup_steps: int,
         router_lr_anneal_steps: int,
         router_min_learning_rate: float,
         weight_decay: float,
@@ -785,6 +787,7 @@ def test_train_command_invokes_distillation_training(
         ood_route_weight: float,
         ood_route_logit_bias: float,
         route_logit_bias_anneal_steps: int,
+        route_logit_bias_anneal_offset_steps: int,
         route_logit_bias_anneal_loss_threshold: float,
         train_shared: bool,
         train_expert_0: bool,
@@ -812,7 +815,9 @@ def test_train_command_invokes_distillation_training(
         assert gradient_checkpointing is True
         assert max_length == 512
         assert learning_rate == 2e-4
+        assert min_learning_rate == 2e-7
         assert router_learning_rate == 0.002
+        assert router_lr_warmup_steps == 11
         assert router_lr_anneal_steps == 75
         assert router_min_learning_rate == 2e-6
         assert weight_decay == 0.1
@@ -832,6 +837,7 @@ def test_train_command_invokes_distillation_training(
         assert ood_route_weight == 0.0
         assert ood_route_logit_bias == 0.0
         assert route_logit_bias_anneal_steps == 0
+        assert route_logit_bias_anneal_offset_steps == 500
         assert route_logit_bias_anneal_loss_threshold == 0.25
         assert train_shared is True
         assert train_expert_0 is True
@@ -870,8 +876,12 @@ def test_train_command_invokes_distillation_training(
             "512",
             "--learning-rate",
             "2e-4",
+            "--min-learning-rate",
+            "2e-7",
             "--router-learning-rate",
             "2e-3",
+            "--router-lr-warmup-steps",
+            "11",
             "--router-lr-anneal-steps",
             "75",
             "--router-min-learning-rate",
@@ -902,6 +912,8 @@ def test_train_command_invokes_distillation_training(
             "0.3",
             "--route-logit-bias-anneal-loss-threshold",
             "0.25",
+            "--route-logit-bias-anneal-offset-steps",
+            "500",
             "--train-shared",
             "--train-expert-0",
             "--freeze-expert-1",
@@ -954,7 +966,10 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "gradient_accumulation_steps": 8,
                 "gradient_checkpointing": True,
                 "learning_rate": 5e-5,
+                "min_learning_rate": 1e-8,
+                "max_grad_norm": 10.0,
                 "router_learning_rate": 1e-3,
+                "router_lr_warmup_steps": 0,
                 "router_lr_anneal_steps": 100,
                 "router_min_learning_rate": 1e-6,
                 "weight_decay": 0.0,
@@ -964,6 +979,7 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "ood_route_weight": 0.0,
                 "ood_route_logit_bias": 0.0,
                 "route_logit_bias_anneal_steps": 0,
+                "route_logit_bias_anneal_offset_steps": 0,
                 "route_logit_bias_anneal_loss_threshold": 5e-2,
                 "train_shared": False,
                 "train_expert_0": False,
@@ -1013,9 +1029,12 @@ def test_train_command_dry_run_prints_report_and_skips_training(
     assert dry_run_payload["dry_run"]["added_token_ids"] == [1, 3]
     assert dry_run_payload["dry_run"]["gradient_accumulation"] == 8
     assert dry_run_payload["dry_run"]["gradient_checkpointing"] is True
+    assert dry_run_payload["dry_run"]["min_learning_rate"] == 1e-8
     assert dry_run_payload["dry_run"]["router_learning_rate"] == 1e-3
+    assert dry_run_payload["dry_run"]["router_lr_warmup_steps"] == 0
     assert dry_run_payload["dry_run"]["router_lr_anneal_steps"] == 100
     assert dry_run_payload["dry_run"]["router_min_learning_rate"] == 1e-6
+    assert dry_run_payload["dry_run"]["route_logit_bias_anneal_offset_steps"] == 0
     assert dry_run_payload["dry_run"]["route_logit_bias_anneal_loss_threshold"] == 5e-2
     assert dry_run_payload["dry_run"]["train_shared"] is False
     assert dry_run_payload["dry_run"]["train_expert_0"] is False
