@@ -789,6 +789,7 @@ def test_train_command_invokes_distillation_training(
         route_logit_bias_anneal_steps: int,
         route_logit_bias_anneal_offset_steps: int,
         route_logit_bias_anneal_loss_threshold: float,
+        combined_loss: bool,
         train_shared: bool,
         train_expert_0: bool,
         train_expert_1: bool,
@@ -839,6 +840,7 @@ def test_train_command_invokes_distillation_training(
         assert route_logit_bias_anneal_steps == 0
         assert route_logit_bias_anneal_offset_steps == 500
         assert route_logit_bias_anneal_loss_threshold == 0.25
+        assert combined_loss is True
         assert train_shared is True
         assert train_expert_0 is True
         assert train_expert_1 is False
@@ -914,6 +916,7 @@ def test_train_command_invokes_distillation_training(
             "0.25",
             "--route-logit-bias-anneal-offset-steps",
             "500",
+            "--combined-loss",
             "--train-shared",
             "--train-expert-0",
             "--freeze-expert-1",
@@ -961,6 +964,7 @@ def test_train_command_dry_run_prints_report_and_skips_training(
                 "distill_ood": True,
                 "distill_original_tokens_only": False,
                 "distill_every": 1,
+                "combined_loss": False,
                 "lr_warmup_steps": 0,
                 "eval_batch_size": 1,
                 "gradient_accumulation_steps": 8,
@@ -1029,6 +1033,7 @@ def test_train_command_dry_run_prints_report_and_skips_training(
     assert dry_run_payload["dry_run"]["added_token_ids"] == [1, 3]
     assert dry_run_payload["dry_run"]["gradient_accumulation"] == 8
     assert dry_run_payload["dry_run"]["gradient_checkpointing"] is True
+    assert dry_run_payload["dry_run"]["combined_loss"] is False
     assert dry_run_payload["dry_run"]["min_learning_rate"] == 1e-8
     assert dry_run_payload["dry_run"]["router_learning_rate"] == 1e-3
     assert dry_run_payload["dry_run"]["router_lr_warmup_steps"] == 0

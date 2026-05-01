@@ -702,6 +702,7 @@ def test_build_training_dry_run_report_lists_trainable_parameters(
     assert report.gradient_checkpointing is True
     assert report.checkpoint_every == 0
     assert report.checkpoint_dir is None
+    assert report.combined_loss is False
     assert report.lr_warmup_steps == 0
     assert report.min_learning_rate == pytest.approx(1e-8)
     assert report.router_lr_warmup_steps == 0
@@ -934,6 +935,7 @@ def test_resume_training_configuration_rejects_different_anneal_steps(tmp_path: 
         distill_ood=False,
         distill_original_tokens_only=False,
         distill_every=1,
+        combined_loss=False,
         lr_warmup_steps=25,
         gradient_accumulation_steps=4,
         gradient_checkpointing=False,
