@@ -2,15 +2,19 @@
 scripts/odin-moe-train.sh 3 \
   --checkpoint-dir checkpoints/odin-moe-3 \
   --overwrite \
-  --steps 100000 \
+  --steps 10000 \
   --print-every 1 \
   --batch-size 4 \
   --gradient-accumulation 4 \
-  --max-length 256 \
+  --max-length 512 \
   --pad-to-max-length \
   --no-gradient-checkpointing \
   --learning-rate 2.5e-5 \
+  --router-lr-anneal-steps 10000 \
   --lr-warmup-steps 1000 \
+  --router-lr-warmup-steps 1000 \
+  --router-learning-rate 2.5e-3 \
+  --router-min-learning-rate 1e-8 \
   --distill-ind \
   --no-distill-ood \
   --distill-original-tokens-only \
@@ -18,12 +22,14 @@ scripts/odin-moe-train.sh 3 \
   --ood-batches-per-cycle 3 \
   --ind-lm-weight 0.05 \
   --ind-distill-weight 2.0 \
-  --ind-route-weight 0.1 \
-  --ind-route-logit-bias -2.0 \
+  --ind-route-weight 1.0 \
+  --ind-route-logit-bias -1.0 \
   --ood-lm-weight 1.0 \
-  --ood-route-weight 0.10 \
-  --ood-route-logit-bias 2.0 \
-  --route-logit-bias-anneal-steps 100000 \
+  --ood-route-weight 1.0 \
+  --ood-route-logit-bias 1.0 \
+  --route-logit-bias-anneal-steps 12500 \
+  --route-logit-bias-anneal-loss-threshold 0 \
   --weight-diff-every 1 \
   --eval-every 100 \
-  --eval-max-batches 32
+  --eval-max-batches 32 \
+  --combined-loss
