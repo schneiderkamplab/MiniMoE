@@ -188,6 +188,11 @@ class _JinjaAstEmitter:
     def _emit_Assign(self, node: nodes.Assign) -> str:
         return f"{{% set {self.emit(node.target)} = {self.emit(node.node)} %}}"
 
+    def _emit_AssignBlock(self, node: nodes.AssignBlock) -> str:
+        filter_str = "" if node.filter is None else f"| {self.emit(node.filter)}"
+        body = self._emit_statements(node.body)
+        return f"{{% set {self.emit(node.target)}{filter_str} %}}{body}{{% endset %}}"
+
     def _emit_For(self, node: nodes.For) -> str:
         header = f"{{% for {self.emit(node.target)} in {self.emit(node.iter)}"
         if node.test is not None:
@@ -323,6 +328,24 @@ class _JinjaAstEmitter:
     def _emit_Add(self, node: nodes.Add) -> str:
         return f"({self.emit(node.left)} + {self.emit(node.right)})"
 
+    def _emit_Sub(self, node: nodes.Sub) -> str:
+        return f"({self.emit(node.left)} - {self.emit(node.right)})"
+
+    def _emit_Mul(self, node: nodes.Mul) -> str:
+        return f"({self.emit(node.left)} * {self.emit(node.right)})"
+
+    def _emit_Div(self, node: nodes.Div) -> str:
+        return f"({self.emit(node.left)} / {self.emit(node.right)})"
+
+    def _emit_FloorDiv(self, node: nodes.FloorDiv) -> str:
+        return f"({self.emit(node.left)} // {self.emit(node.right)})"
+
+    def _emit_Mod(self, node: nodes.Mod) -> str:
+        return f"({self.emit(node.left)} % {self.emit(node.right)})"
+
+    def _emit_Pow(self, node: nodes.Pow) -> str:
+        return f"({self.emit(node.left)} ** {self.emit(node.right)})"
+
     def _emit_And(self, node: nodes.And) -> str:
         return f"({self.emit(node.left)} and {self.emit(node.right)})"
 
@@ -331,6 +354,12 @@ class _JinjaAstEmitter:
 
     def _emit_Not(self, node: nodes.Not) -> str:
         return f"(not {self.emit(node.node)})"
+
+    def _emit_Neg(self, node: nodes.Neg) -> str:
+        return f"(-{self.emit(node.node)})"
+
+    def _emit_Pos(self, node: nodes.Pos) -> str:
+        return f"(+{self.emit(node.node)})"
 
     def _emit_CondExpr(self, node: nodes.CondExpr) -> str:
         if node.expr2 is None:
