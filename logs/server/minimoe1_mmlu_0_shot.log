@@ -1,0 +1,24 @@
+[transformers] You are using a model of type `OdinMoE` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+/work/training/minimoe/serve_model_checkpoint_batched.py:159: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+/work/training/minimoe/serve_model_checkpoint_batched.py:164: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("shutdown")
+INFO:     Started server process [191612]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8000): [errno 98] address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+Loading model...
+cuda:0
+Model ready!

@@ -1,0 +1,324 @@
+[
+  {
+    "model": "baseline",
+    "dataset": "dala",
+    "metrics": {
+      "macro_f1": 0.5684015481132466,
+      "mcc": 0.23821898764262625
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "danish-citizen-tests",
+    "metrics": {
+      "accuracy": 0.6330275229357798,
+      "mcc": 0.4617222582286614
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "gec",
+    "metrics": {
+      "mean": 0.42578125,
+      "stderr": 0.0154594533884556
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "ifeval-da",
+    "metrics": {
+      "prompt_strict_acc": 0.2033271719038817,
+      "prompt_strict_stderr": 0.01731971864183471,
+      "prompt_loose_acc": 0.20702402957486138,
+      "prompt_loose_stderr": 0.017435865587996542,
+      "inst_strict_acc": 0.35354691075514877,
+      "inst_strict_stderr": 0.015795993390422064,
+      "inst_loose_acc": 0.36155606407322655,
+      "inst_loose_stderr": 0.01581411923908407,
+      "final_acc": 0.2813635440767796,
+      "final_stderr": 0.015419978719674531
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "multi",
+    "metrics": {
+      "mean": 0.6649655054884693,
+      "stderr": 0.008191854233811427
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "piqa",
+    "metrics": {
+      "accuracy": 0.4722222222222222
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "dala",
+    "metrics": {
+      "macro_f1": 0.5750940563516138,
+      "mcc": 0.19679069253229
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "danish-citizen-tests",
+    "metrics": {
+      "accuracy": 0.6036697247706422,
+      "mcc": 0.4199830660621357
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "gec",
+    "metrics": {
+      "mean": 0.3798828125,
+      "stderr": 0.015174831933509313
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "ifeval-da",
+    "metrics": {
+      "prompt_strict_acc": 0.6266173752310537,
+      "prompt_strict_stderr": 0.02081523837683445,
+      "prompt_loose_acc": 0.6561922365988909,
+      "prompt_loose_stderr": 0.020439793487859976,
+      "inst_strict_acc": 0.7391304347826086,
+      "inst_strict_stderr": 0.01482825403507334,
+      "inst_loose_acc": 0.7608695652173914,
+      "inst_loose_stderr": 0.014550696795829196,
+      "final_acc": 0.6957024029574861,
+      "final_stderr": 0.018936890700614644
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "multi",
+    "metrics": {
+      "mean": 0.6202423690845498,
+      "stderr": 0.008555613755026547
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "piqa",
+    "metrics": {
+      "accuracy": 0.4166666666666667
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "dala",
+    "metrics": {
+      "macro_f1": 0.5879992392726452,
+      "mcc": 0.17848799536978047
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "danish-citizen-tests",
+    "metrics": {
+      "accuracy": 0.6220183486238532,
+      "mcc": 0.4473675465708353
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "gec",
+    "metrics": {
+      "accuracy": 0.6220183486238532,
+      "mcc": 0.4473675465708353
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "ifeval-da",
+    "metrics": {
+      "prompt_strict_acc": 0.5619223659889094,
+      "prompt_strict_stderr": 0.021350931135490865,
+      "prompt_loose_acc": 0.6025878003696857,
+      "prompt_loose_stderr": 0.021058812847519905,
+      "inst_strict_acc": 0.6876430205949656,
+      "inst_strict_stderr": 0.015506107566642998,
+      "inst_loose_acc": 0.7219679633867276,
+      "inst_loose_stderr": 0.01501807009609512,
+      "final_acc": 0.6435302875850721,
+      "final_stderr": 0.019058661677755225
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "multi",
+    "metrics": {
+      "mean": 0.5890827477366944,
+      "stderr": 0.008667830857339756
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "piqa",
+    "metrics": {
+      "accuracy": 0.49074074074074076
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "mmlu",
+    "metrics": {
+      "accuracy": 0.49074074074074076
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "danish-citizen-tests",
+    "metrics": {
+      "accuracy": 0.6110091743119266,
+      "mcc": 0.4301024544128053
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "gec",
+    "metrics": {
+      "accuracy": 0.6110091743119266,
+      "mcc": 0.4301024544128053
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "ifeval-da",
+    "metrics": {
+      "prompt_strict_acc": 0.6025878003696857,
+      "prompt_strict_stderr": 0.021058812847519905,
+      "prompt_loose_acc": 0.634011090573013,
+      "prompt_loose_stderr": 0.02072934168450657,
+      "inst_strict_acc": 0.7116704805491991,
+      "inst_strict_stderr": 0.01584724725310629,
+      "inst_loose_acc": 0.7391304347826086,
+      "inst_loose_stderr": 0.015125235928526654,
+      "final_acc": 0.6718499515686266,
+      "final_stderr": 0.019370326636437427
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "multi",
+    "metrics": {
+      "mean": 0.6249770223268629,
+      "stderr": 0.008463220686127431
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "piqa",
+    "metrics": {
+      "accuracy": 0.4722222222222222
+    }
+  },
+  {
+    "model": "minimoe3",
+    "dataset": "dala",
+    "metrics": {
+      "macro_f1": 0.554858125450071,
+      "mcc": 0.1887116389386362
+    }
+  },
+  {
+    "model": "minimoe3",
+    "dataset": "danish-citizen-tests",
+    "metrics": {
+      "accuracy": 0.5963302752293578,
+      "mcc": 0.4197450179662566
+    }
+  },
+  {
+    "model": "minimoe3",
+    "dataset": "gec",
+    "metrics": {
+      "accuracy": 0.5963302752293578,
+      "mcc": 0.4197450179662566
+    }
+  },
+  {
+    "model": "minimoe3",
+    "dataset": "ifeval-da",
+    "metrics": {
+      "prompt_strict_acc": 0.6284658040665434,
+      "prompt_strict_stderr": 0.020794253888707582,
+      "prompt_loose_acc": 0.6487985212569316,
+      "prompt_loose_stderr": 0.020541692024854775,
+      "inst_strict_acc": 0.7391304347826086,
+      "inst_strict_stderr": 0.014712434065333135,
+      "inst_loose_acc": 0.7597254004576659,
+      "inst_loose_stderr": 0.014098917103113897,
+      "final_acc": 0.6940300401409374,
+      "final_stderr": 0.01900840138929833
+    }
+  },
+  {
+    "model": "minimoe3",
+    "dataset": "multi",
+    "metrics": {
+      "mean": 0.6362297969992016,
+      "stderr": 0.008586304476653634
+    }
+  },
+  {
+    "model": "minimoe3",
+    "dataset": "piqa",
+    "metrics": {
+      "accuracy": 0.4351851851851852
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "mmlu_pro",
+    "metrics": {
+      "accuracy": 0.6058011968085106,
+      "stderr": 0.004455247660257375
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "mmlu_0_shot",
+    "metrics": {
+      "accuracy": 0.22795436607591305,
+      "stderr": 0.003553664093844569
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "mmlu_pro",
+    "metrics": {
+      "accuracy": 0.6058843085106383,
+      "stderr": 0.004455083541687314
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "mmlu_0_shot",
+    "metrics": {
+      "accuracy": 0.22788261462294612,
+      "stderr": 0.0035532698732521034
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "mmlu_pro",
+    "metrics": {
+      "accuracy": 0.6012300531914894,
+      "stderr": 0.004464066827261348
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "mmlu_0_shot",
+    "metrics": {
+      "accuracy": 0.22709334864030997,
+      "stderr": 0.003548923686343468
+    }
+  }
+]
