@@ -1,0 +1,17 @@
+datasets
+transformers
+torch
+numpy
+huggingface_hub
+jinja2
+uvicorn
+fastapi
+inspect_ai
+trueskill
+openai
+Torchvision
+accelerate
+git+https://github.com/josejg/instruction_following_eval.git
+inspect-evals
+
+#  pip install -r requirements.txt
