@@ -3,3 +3,5 @@
 /models
 /tests/data
 __pycache__
+read_files.ipynb
+*.eval
