@@ -1,0 +1,25 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading model...
+Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  38%|███▊      | 751/1951 [00:00<00:00, 4783.42it/s]Loading weights:  63%|██████▎   | 1230/1951 [00:00<00:00, 1309.77it/s]Loading weights:  88%|████████▊ | 1724/1951 [00:00<00:00, 1878.72it/s]Loading weights: 100%|██████████| 1951/1951 [00:00<00:00, 2073.39it/s]
+INFO:     Started server process [1260374]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Model ready!
+INFO:     127.0.0.1:56844 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:36794 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36804 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36782 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36806 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36812 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36814 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36828 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36842 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36820 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     127.0.0.1:36858 - "POST /v1/chat/completions HTTP/1.1" 422 Unprocessable Content
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [1260374]
+/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/multiprocessing/resource_tracker.py:396: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-sqi3_ov9'}
+  warnings.warn(

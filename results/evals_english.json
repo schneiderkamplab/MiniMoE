@@ -1,0 +1,42 @@
+[
+  {
+    "model": "baseline",
+    "dataset": "aime2026",
+    "metrics": {
+      "aime_scorer_accuracy": 0.43333333333333335,
+      "aime_scorer_stderr": 0.09201865544655373
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "gpqa_diamond",
+    "metrics": {
+      "choice_accuracy": 0.3888888888888889,
+      "choice_stderr": 0.03473279590836963
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "tau2_retail",
+    "metrics": {
+      "retail_scorer_accuracy": 0.06140350877192982,
+      "retail_scorer_stderr": 0.022583790467498373
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "tau2_airline",
+    "metrics": {
+      "airline_scorer_accuracy": 0.38,
+      "airline_scorer_stderr": 0.06934092056863769
+    }
+  },
+  {
+    "model": "baseline",
+    "dataset": "tau2_telecom",
+    "metrics": {
+      "telecom_scorer_accuracy": 0.0,
+      "telecom_scorer_stderr": 0.0
+    }
+  }
+]

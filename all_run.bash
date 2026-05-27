@@ -1,7 +1,7 @@
 #!/bin/bash
 #set -e
-MINIMOE_DIR="/work/training/minimoe"
-LOGS_DIR="$MINIMOE_DIR/logs"
+MINIMOE_DIR="/work/training/MiniMoE"
+LOGS_DIR="$MINIMOE_DIR/logs_english_checkpoints"
 RESULTS_DIR="$MINIMOE_DIR/results"
 EVALS_DIR="/work/training/dfm-evals"
 
@@ -20,12 +20,23 @@ EVALS=(
   #"dfm_evals/tasks/ifeval_da.py@ifeval-da"
   #"dfm_evals/tasks/multi_wiki_qa.py@multi_wiki_qa"
   #"dfm_evals/tasks/piqa.py@piqa"
-  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu_pro/mmlu_pro.py@mmlu_pro"
-  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu/mmlu.py@mmlu_0_shot"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu_pro/mmlu_pro.py@mmlu_pro"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu/mmlu.py@mmlu_0_shot"
+  #"ruler_task.py@ruler"
+  #"talemaader_task.py@generative-talemaader"
+  #"dfm_evals/tasks/wmt24pp.py@wmt24pp-en-da"
+  #"dfm_evals/tasks/daisy.py@daisy"
+  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/aime2026/aime2026.py@aime2026"
+  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/gpqa/gpqa.py@gpqa_diamond"
+  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/tau2/tau2.py@tau2_retail"
+  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/tau2/tau2.py@tau2_airline"
+  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/tau2/tau2.py@tau2_telecom"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/hle/hle.py@hle" # i get this error: UnprocessableEntityError("Error code: 422 - {'detail': [{'type': 'string_type', 'loc': ['body', 'messages', 1, 'content'], 'msg': 'Input should be a valid string', 'input': [{'type': 'text', 'text': 'Calculate a left coprime factorization of the following transfer function:\\n\\\\[\\nH(s) = \\\\begin{bmatrix} \\\\frac{s-1}{s+1} & 1 \\\\\\\\ \\\\frac{2}{s^2-1} & 0 \\\\end{bmatrix}\\n\\\\]\\nUse the following notation:\\n\\\\[\\nH(s) = D^{-1}(s) N(s)\\n\\\\]'}]}]}")     
+  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/bbeh/bbeh.py@bbeh"
 )
 
 if [ -z "$1" ]; then
-  CHECKPOINTS="2 3" # ADD 0 1 2 3
+  CHECKPOINTS="0 1 2 3" # ADD 0 1 2 3
 else
   CHECKPOINTS="$1"
 fi
@@ -45,7 +56,7 @@ for CHECKPOINT_NUM in $CHECKPOINTS; do
     echo "--- Running eval: $DATASET ---"
 
      # Kill any existing server
-    pkill -f "serve_model_checkpoint.py" 2>/dev/null || true
+    pkill -f "serve_model_checkpoint_batched.py" 2>/dev/null || true
     sleep 2
 
     # Start server with log per eval
@@ -91,25 +102,17 @@ for CHECKPOINT_NUM in $CHECKPOINTS; do
       continue
     fi
 
-    # python -m inspect_ai eval $EVALS_DIR/$EVAL \
-    #   --model openai/my-custom-model \
-    #   --log-dir $LOGS_DIR
 
-    # if [[ "$EVAL" == /* ]]; then
-    # # Absolute path, use as-is
+
     # python -m inspect_ai eval $EVAL \
     #     --model openai/my-custom-model \
+    #     --max-connections 8 \
+    #     --max-samples 8 \
     #     --log-dir $LOGS_DIR
-    # else
-    # # Relative path, prepend EVALS_DIR
-    # python -m inspect_ai eval $EVALS_DIR/$EVAL \
-    #     --model openai/my-custom-model \
-    #     --log-dir $LOGS_DIR
-    # fi
+
+    # TO RUN english evals
 
     if [[ "$EVAL" == /* ]]; then
-    # Absolute path, use as-is
-
     python -m inspect_ai eval $EVAL \
         --model openai/my-custom-model \
         --max-connections 8 \
@@ -130,7 +133,7 @@ for CHECKPOINT_NUM in $CHECKPOINTS; do
 
     python $MINIMOE_DIR/extract_metrics.py \
       $LOGS_DIR/$EVAL_NAME.eval \
-      $RESULTS_DIR/evals.json
+      $RESULTS_DIR/evals_english_checkpoints.json
   done
 
   kill $SERVER_PID 2>/dev/null
@@ -139,4 +142,4 @@ for CHECKPOINT_NUM in $CHECKPOINTS; do
   echo "=== Done with checkpoint $CHECKPOINT_NUM ==="
 done
 
-echo "All done! Results in $RESULTS_DIR/evals.json"
+echo "All done! Results in $RESULTS_DIR/evals_english_checkpoints.json"

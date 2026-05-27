@@ -1,0 +1,16 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading model...
+Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  39%|███▊      | 754/1951 [00:00<00:00, 5734.77it/s]Loading weights:  68%|██████▊   | 1328/1951 [00:00<00:00, 1327.31it/s]Loading weights: 100%|██████████| 1951/1951 [00:00<00:00, 2098.82it/s]
+INFO:     Started server process [22435]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Model ready!
+INFO:     127.0.0.1:52462 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [22435]
+/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/multiprocessing/resource_tracker.py:396: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-qzmfwprm'}
+  warnings.warn(

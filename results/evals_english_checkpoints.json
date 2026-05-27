@@ -1,0 +1,91 @@
+[
+  
+  {
+    "model": "minimoe0",
+    "dataset": "mmlu_pro",
+    "metrics": {
+      "accuracy": 0.6058011968085106,
+      "stderr": 0.004455247660257375
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "mmlu_0_shot",
+    "metrics": {
+      "accuracy": 0.22795436607591305,
+      "stderr": 0.003553664093844569
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "mmlu_pro",
+    "metrics": {
+      "accuracy": 0.6058843085106383,
+      "stderr": 0.004455083541687314
+    }
+  },
+  {
+    "model": "minimoe1",
+    "dataset": "mmlu_0_shot",
+    "metrics": {
+      "accuracy": 0.22788261462294612,
+      "stderr": 0.0035532698732521034
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "mmlu_pro",
+    "metrics": {
+      "accuracy": 0.6012300531914894,
+      "stderr": 0.004464066827261348
+    }
+  },
+  {
+    "model": "minimoe2",
+    "dataset": "mmlu_0_shot",
+    "metrics": {
+      "accuracy": 0.22709334864030997,
+      "stderr": 0.003548923686343468
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "aime2026",
+    "metrics": {
+      "aime_scorer_accuracy": 0.36666666666666664,
+      "aime_scorer_stderr": 0.08948554539839962
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "gpqa_diamond",
+    "metrics": {
+      "choice_accuracy": 0.3926767676767677,
+      "choice_stderr": 0.02692702908753554
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "tau2_retail",
+    "metrics": {
+      "retail_scorer_accuracy": 0.06140350877192982,
+      "retail_scorer_stderr": 0.022583790467498373
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "tau2_airline",
+    "metrics": {
+      "airline_scorer_accuracy": 0.38,
+      "airline_scorer_stderr": 0.06934092056863769
+    }
+  },
+  {
+    "model": "minimoe0",
+    "dataset": "tau2_telecom",
+    "metrics": {
+      "telecom_scorer_accuracy": 0.0,
+      "telecom_scorer_stderr": 0.0
+    }
+  }
+]

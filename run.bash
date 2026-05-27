@@ -23,7 +23,7 @@
 
 
 
-MINIMOE_DIR="/work/training/minimoe"
+MINIMOE_DIR="/work/training/MiniMoE"
 LOGS_DIR="$MINIMOE_DIR/logs"
 RESULTS_DIR="$MINIMOE_DIR/results"
 EVALS_DIR="/work/training/dfm-evals"
@@ -37,53 +37,26 @@ mkdir -p $LOGS_DIR
 mkdir -p $RESULTS_DIR
 
 EVALS=(
-  # "dfm_evals/tasks/dala.py@dala"
-  # "dfm_evals/tasks/danish_citizen_tests2.py@danish-citizen-tests"
-  # "dfm_evals/tasks/gec_dala.py@gec_dala"
-  # "dfm_evals/tasks/ifeval_da.py@ifeval-da"
-  # "dfm_evals/tasks/multi_wiki_qa.py@multi_wiki_qa"
-  # "dfm_evals/tasks/piqa.py@piqa"
-  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu_pro/mmlu_pro.py@mmlu_pro"
-  "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu/mmlu.py@mmlu_0_shot"
+   "dfm_evals/tasks/dala.py@dala"
+   "dfm_evals/tasks/danish_citizen_tests2.py@danish-citizen-tests"
+   "dfm_evals/tasks/gec_dala.py@gec_dala"
+   "dfm_evals/tasks/ifeval_da.py@ifeval-da"
+   "dfm_evals/tasks/multi_wiki_qa.py@multi_wiki_qa"
+   "dfm_evals/tasks/piqa.py@piqa"
+  # "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu_pro/mmlu_pro.py@mmlu_pro"
+  # "/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/mmlu/mmlu.py@mmlu_0_shot"
+  "ruler_task.py@ruler"
+  "talemaader_task.py@generative-talemaader"
+  "dfm_evals/tasks/wmt24pp.py@wmt24pp-en-da"
+  "dfm_evals/tasks/daisy.py@daisy"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/aime2026/aime2026.py@aime2026"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/gpqa/gpqa.py@gpqa"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/tau2/tau2.py@tau2"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/hle/hle.py@hle"
+  #"/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/site-packages/inspect_evals/bbeh/bbeh.py@bbeh"
+
 )
 
-# # Kill any existing server
-# pkill -f "serve_model.py" 2>/dev/null || true
-# sleep 2
-
-# # Start Gemma server
-# python $MINIMOE_DIR/serve_model.py \
-#   > $LOGS_DIR/server_baseline.log 2>&1 &
-# SERVER_PID=$!
-
-# Poll until server is up
-# echo "Waiting for server to start..."
-# SERVER_READY=false
-# for i in $(seq 1 120); do
-#   RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/v1/chat/completions \
-#     -H "Content-Type: application/json" \
-#     -d '{"model": "my-gemma", "messages": [{"role": "user", "content": "ja?"}], "max_tokens": 8}')
-
-#   if [ "$RESPONSE" == "200" ]; then
-#     echo "Server is up after ${i} seconds!"
-#     SERVER_READY=true
-#     break
-#   fi
-
-#   if ! kill -0 $SERVER_PID 2>/dev/null; then
-#     echo "ERROR: Server process died. Check server_baseline.log"
-#     cat $LOGS_DIR/server_baseline.log
-#     exit 1
-#   fi
-
-#   echo "Waiting... (${i}/120s)"
-#   sleep 1
-# done
-
-# if [ "$SERVER_READY" != "true" ]; then
-#   echo "ERROR: Server did not start, aborting."
-#   exit 1
-# fi
 
 cd $EVALS_DIR
 
@@ -133,15 +106,21 @@ for EVAL in "${EVALS[@]}"; do
     continue
   fi
 
-  if [[ "$EVAL" == /* ]]; then
-    python -m inspect_ai eval $EVAL \
+  python -m inspect_ai eval $EVAL \
       --model openai/my-gemma \
       --log-dir $LOGS_DIR
-  else
-    python -m inspect_ai eval $EVALS_DIR/$EVAL \
-      --model openai/my-gemma \
-      --log-dir $LOGS_DIR
-  fi
+
+  # if [[ "$EVAL" == /* ]]; then
+  #   python -m inspect_ai eval $EVAL \
+  #     --model openai/my-gemma \
+  #     --log-dir $LOGS_DIR
+  # else
+  #   python -m inspect_ai eval $EVALS_DIR/$EVAL \
+  #     --model openai/my-custom-model \
+  #     --max-connections 8 \
+  #     --max-samples 8 \
+  #     --log-dir $LOGS_DIR
+  # fi
 
   LATEST=$(ls -t $LOGS_DIR/*.eval | head -1)
   mv "$LATEST" $LOGS_DIR/$EVAL_NAME.eval

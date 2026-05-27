@@ -1,0 +1,11 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading model...
+Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  38%|███▊      | 742/1951 [00:00<00:00, 7419.10it/s]Loading weights:  76%|███████▌  | 1484/1951 [00:00<00:00, 1591.06it/s]Loading weights: 100%|██████████| 1951/1951 [00:00<00:00, 2221.36it/s]
+INFO:     Started server process [1235229]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+ERROR:    [Errno 98] error while attempting to bind on address ('0.0.0.0', 8000): [errno 98] address already in use
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+Model ready!

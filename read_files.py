@@ -1,6 +1,6 @@
 from inspect_ai.log import read_eval_log
 
-log = read_eval_log("/work/training/minimoe/logs/minimoe2_mmlu_0_shot.eval")
+log = read_eval_log("/work/training/MiniMoE/logs_english/baseline_tau2_airline.eval")
 
 # Top-level info
 print(log.status)       # "success", "error", etc.

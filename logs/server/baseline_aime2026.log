@@ -1,0 +1,46 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Loading model...
+Loading weights:   0%|          | 0/1951 [00:00<?, ?it/s]Loading weights:  39%|███▊      | 752/1951 [00:00<00:00, 4609.23it/s]Loading weights:  62%|██████▏   | 1213/1951 [00:00<00:00, 1191.35it/s]Loading weights:  90%|████████▉ | 1750/1951 [00:00<00:00, 1805.59it/s]Loading weights: 100%|██████████| 1951/1951 [00:00<00:00, 1955.74it/s]
+INFO:     Started server process [24352]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+Model ready!
+INFO:     127.0.0.1:46106 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46134 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46122 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46146 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46148 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46152 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46162 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46172 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46188 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46200 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46208 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46134 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46122 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46146 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46148 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46152 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46162 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46172 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46188 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46200 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46208 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46134 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46122 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46146 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46148 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46152 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46162 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46172 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46188 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46200 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:46208 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:     Application shutdown complete.
+INFO:     Finished server process [24352]
+/home/ucloud/miniconda3/envs/minimoe/lib/python3.14/multiprocessing/resource_tracker.py:396: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown: {'/mp-_h_k1og2'}
+  warnings.warn(
