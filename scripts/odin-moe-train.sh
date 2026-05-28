@@ -48,11 +48,19 @@ fi
 if [[ ${#default_args[@]} -gt 0 ]]; then
   set -- "${default_args[@]}" "$@"
 fi
+echo "ARGS: $@"
 
 tokcleanse train models/odin-moe models/odin-danish models/odin-moe-trained-$exp \
-  --ind-file data/data/just-cp-cp-0-of-7-train.jinx \
-  --ood-file data/data/just-dyna-dyna-0-of-1-train.jinx \
   --eval-file data/data/just-dyna-dyna-0-of-1-test.jinx \
+  --ind-file /work/training/MiniMoE/data/hf/dolci-instruct-ind.jsonl \
+  --ood-file /work/training/MiniMoE/data/hf/danishunivportals-ood.jsonl \
+  --ood-file /work/training/MiniMoE/data/hf/dynaword-bt-ood.jsonl \
+  --ood-file /work/training/MiniMoE/data/hf/europarl-da-ood.jsonl \
+  --checkpoint-dir checkpoints/$exp \
   --no-torch-compile \
   --checkpoint-every 10000 \
   "$@"
+
+
+# --ind-file data/data/just-cp-cp-0-of-7-train.jinx \
+#   --ood-file data/data/just-dyna-dyna-0-of-1-train.jinx \
