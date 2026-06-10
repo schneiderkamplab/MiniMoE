@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import gc
 import gzip
-import math
 import json
+import math
 import os
 import random
 import shutil
@@ -16,6 +16,7 @@ from io import TextIOWrapper
 from pathlib import Path
 from typing import Any
 
+import typer
 from tqdm import tqdm
 
 from ._moe import _load_causal_lm_for_runtime, _load_tokenizer_for_runtime
@@ -887,12 +888,12 @@ def train_distilled_model(
         or (distill_ood and ood_distill_weight > 0)
     )
     ind_stream = (
-        _CorpusStream(ind_files, rng=random.Random(rng.randrange(1 << 30)))
+        _IndexedCorpusStream(ind_files, rng=random.Random(rng.randrange(1 << 30)))
         if ind_files
         else None
     )
     ood_stream = (
-        _CorpusStream(ood_files, rng=random.Random(rng.randrange(1 << 30)))
+        _IndexedCorpusStream(ood_files, rng=random.Random(rng.randrange(1 << 30)))
         if ood_files
         else None
     )
@@ -1720,44 +1721,206 @@ def train_distilled_model(
         _release_resources(torch_module=torch)
 
 
+_INDEX_VERSION = 1
+_INDEX_FILENAME_SUFFIX = ".index"
+_WARN_LINE_COUNT = 1_000_000_000
+
+
 @dataclass(slots=True)
-class _CorpusStream:
+class _IndexedCorpusStream:
     paths: tuple[Path, ...]
     rng: random.Random
-    _path_order: list[Path] = field(init=False, repr=False)
-    _path_index: int = field(init=False, repr=False)
-    _current_handle: TextIOWrapper | Any | None = field(init=False, repr=False)
-    _current_path: Path | None = field(init=False, repr=False)
+    _index: list[tuple[int, int]] = field(init=False, repr=False)
+    _shuffled_index: list[tuple[int, int]] = field(init=False, repr=False)
+    _index_position: int = field(init=False, repr=False)
+    _file_handles: dict[int, Any] = field(init=False, repr=False, default_factory=dict)
+    _total_lines: int = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.paths:
             raise ValueError("Corpus stream requires at least one input file")
-        self._path_order = [path.expanduser() for path in self.paths]
-        self.rng.shuffle(self._path_order)
-        self._path_index = 0
-        self._current_handle = None
-        self._current_path = None
+        self._index = []
+        self._shuffled_index = []
+        self._index_position = 0
+        self._total_lines = 0
+        self._build_or_load_indices()
+        self._shuffle_index()
+
+    def _build_or_load_indices(self) -> None:
+        for file_id, path in enumerate(self.paths):
+            path = path.expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"Corpus file not found: {path}")
+            self._build_or_load_index_for_file(file_id, path)
+
+    def _build_or_load_index_for_file(self, file_id: int, path: Path) -> None:
+        index_path = self._get_index_path(path)
+        persisted_index = self._load_persisted_index(index_path, path)
+        if persisted_index is not None:
+            offsets = persisted_index
+            typer.echo(f"Loaded cached index from {index_path}", err=True)
+        else:
+            offsets = self._build_index_for_file(path)
+            self._persist_index(index_path, offsets, path)
+            typer.echo(f"Built and cached index at {index_path}", err=True)
+
+        start_offset = len(self._index)
+        for offset in offsets:
+            self._index.append((file_id, offset))
+        self._total_lines = len(self._index)
+
+        if self._total_lines >= _WARN_LINE_COUNT:
+            typer.echo(
+                f"Warning: Index contains {self._total_lines:,} lines "
+                f"(~{self._total_lines * 12 / 1_000_000_000:.1f}GB memory)",
+                err=True,
+            )
+
+    def _get_index_path(self, data_path: Path) -> Path:
+        return Path(str(data_path) + _INDEX_FILENAME_SUFFIX)
+
+    def _load_persisted_index(self, index_path: Path, data_path: Path) -> list[int] | None:
+        if not index_path.exists():
+            return None
+
+        try:
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return None
+
+            metadata = data.get("metadata")
+            if not isinstance(metadata, dict):
+                return None
+
+            stored_size = metadata.get("file_size")
+            if not isinstance(stored_size, int):
+                return None
+
+            current_size = data_path.stat().st_size
+            if stored_size != current_size:
+                typer.echo(
+                    f"Index file size mismatch ({stored_size} vs {current_size}), rebuilding...",
+                    err=True,
+                )
+                return None
+
+            version = metadata.get("version", 0)
+            if version != _INDEX_VERSION:
+                typer.echo(
+                    f"Index version mismatch ({version} vs {_INDEX_VERSION}), rebuilding...",
+                    err=True,
+                )
+                return None
+
+            offsets = data.get("offsets")
+            if not isinstance(offsets, list) or not all(isinstance(x, int) for x in offsets):
+                return None
+
+            return offsets
+        except (json.JSONDecodeError, OSError) as e:
+            typer.echo(f"Failed to load index: {e}", err=True)
+            return None
+
+    def _build_index_for_file(self, path: Path) -> list[int]:
+        offsets = []
+        offset = 0
+
+        typer.echo(f"Building index for {path}...", err=True)
+
+        try:
+            with path.open("rb") as f:
+                while True:
+                    offsets.append(offset)
+                    line = f.readline()
+                    if not line:
+                        break
+                    offset = f.tell()
+
+                    if len(offsets) % 1_000_000 == 0:
+                        typer.echo(f"  Indexed {len(offsets):,} lines...", err=True)
+
+        except OSError as e:
+            raise OSError(f"Failed to build index for {path}: {e}") from e
+
+        typer.echo(f"  Completed: {len(offsets):,} lines", err=True)
+        return offsets
+
+    def _persist_index(self, index_path: Path, offsets: list[int], data_path: Path) -> None:
+        data = {
+            "offsets": offsets,
+            "metadata": {
+                "file_size": data_path.stat().st_size,
+                "line_count": len(offsets),
+                "version": _INDEX_VERSION,
+            },
+        }
+
+        try:
+            index_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            typer.echo(f"Warning: Failed to persist index: {e}", err=True)
+
+    def _shuffle_index(self) -> None:
+        if not self._index:
+            raise ValueError("No examples in corpus index")
+        self._shuffled_index = self.rng.sample(self._index, len(self._index))
 
     def next_batch(self, batch_size: int) -> tuple[str, ...]:
-        return tuple(self._next_example() for _ in range(batch_size))
+        batch = []
+        for _ in range(batch_size):
+            if self._index_position >= len(self._shuffled_index):
+                self._shuffle_index()
+                self._index_position = 0
+                typer.echo("Completed full epoch, reshuffling index", err=True)
+
+            file_id, offset = self._shuffled_index[self._index_position]
+            self._index_position += 1
+
+            text = self._read_example(file_id, offset)
+            if text is not None:
+                batch.append(text)
+
+        if not batch:
+            raise ValueError("Corpus files do not contain any usable examples")
+        return tuple(batch)
+
+    def _read_example(self, file_id: int, offset: int) -> str | None:
+        if file_id not in self._file_handles:
+            path = self.paths[file_id].expanduser()
+            self._file_handles[file_id] = path.open("rb")
+
+        handle = self._file_handles[file_id]
+        handle.seek(offset)
+        line_bytes = handle.readline()
+
+        if not line_bytes:
+            return None
+
+        try:
+            line = line_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            typer.echo(f"Warning: Failed to decode line at offset {offset} in file {file_id}", err=True)
+            return None
+
+        path = self.paths[file_id].expanduser()
+        parsed = _parse_corpus_line(path, line)
+        return parsed
 
     def close(self) -> None:
-        if self._current_handle is not None:
-            self._current_handle.close()
-            self._current_handle = None
-            self._current_path = None
+        for handle in self._file_handles.values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        self._file_handles.clear()
 
     def state_dict(self) -> dict[str, Any]:
-        current_offset: int | None = None
-        if self._current_handle is not None and hasattr(self._current_handle, "tell"):
-            current_offset = int(self._current_handle.tell())
         return {
             "paths": [str(path) for path in self.paths],
-            "path_order": [str(path) for path in self._path_order],
-            "path_index": self._path_index,
-            "current_path": str(self._current_path) if self._current_path is not None else None,
-            "current_offset": current_offset,
+            "index_position": self._index_position,
+            "total_lines": self._total_lines,
             "rng_state": self.rng.getstate(),
+            "index_version": _INDEX_VERSION,
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -1765,60 +1928,32 @@ class _CorpusStream:
         expected_paths = [str(path.expanduser()) for path in self.paths]
         if saved_paths != expected_paths:
             raise ValueError("Cannot resume with different corpus files")
-        path_order = state_dict.get("path_order")
-        if not isinstance(path_order, list) or not all(isinstance(item, str) for item in path_order):
-            raise ValueError("training-state path_order must be a list of strings")
-        if set(path_order) != set(expected_paths):
-            raise ValueError("training-state path_order does not match corpus files")
-        path_index = state_dict.get("path_index")
-        if not isinstance(path_index, int) or not (0 <= path_index < len(path_order)):
-            raise ValueError("training-state path_index is invalid")
-        current_path = state_dict.get("current_path")
-        if current_path is not None and current_path not in path_order:
-            raise ValueError("training-state current_path is invalid")
-        current_offset = state_dict.get("current_offset")
-        if current_offset is not None and (not isinstance(current_offset, int) or current_offset < 0):
-            raise ValueError("training-state current_offset must be a non-negative integer or null")
-        self.close()
-        self._path_order = [Path(path) for path in path_order]
-        self._path_index = path_index
-        self._current_path = None
-        self._current_handle = None
+
+        saved_version = state_dict.get("index_version", 0)
+        if saved_version != _INDEX_VERSION:
+            raise ValueError(
+                f"Incompatible index version: {saved_version} vs {_INDEX_VERSION}. "
+                "Cannot resume from old checkpoint."
+            )
+
+        index_position = state_dict.get("index_position")
+        if not isinstance(index_position, int) or index_position < 0:
+            raise ValueError("training-state index_position must be a non-negative integer")
+
         rng_state = state_dict.get("rng_state")
         if rng_state is None:
             raise ValueError("training-state rng_state is missing")
-        self.rng.setstate(rng_state)
-        if current_path is not None and current_offset is not None:
-            self._current_path = Path(current_path)
-            self._current_handle = _open_text_handle(self._current_path)
-            self._current_handle.seek(current_offset)
 
-    def _next_example(self) -> str:
-        visited_paths = 0
-        while visited_paths < len(self._path_order):
-            handle = self._ensure_open_handle()
-            raw_line = handle.readline()
-            if raw_line == "":
-                self._advance_path()
-                visited_paths += 1
-                continue
-            parsed = _parse_corpus_line(self._current_path, raw_line)
-            if parsed is None:
-                continue
-            return parsed
-        raise ValueError("Corpus files do not contain any usable examples")
-
-    def _ensure_open_handle(self) -> Any:
-        if self._current_handle is None:
-            self._current_path = self._path_order[self._path_index]
-            self._current_handle = _open_text_handle(self._current_path)
-        return self._current_handle
-
-    def _advance_path(self) -> None:
         self.close()
-        self._path_index = (self._path_index + 1) % len(self._path_order)
-        if self._path_index == 0:
-            self.rng.shuffle(self._path_order)
+        self._build_or_load_indices()
+        self._shuffle_index()
+        self._index_position = index_position
+        self.rng.setstate(rng_state)
+
+        typer.echo(
+            f"Resumed from index position {index_position:,} / {len(self._shuffled_index):,}",
+            err=True,
+        )
 
 
 @dataclass(slots=True)
@@ -2336,8 +2471,8 @@ def _next_text_batch(
     *,
     language: str,
     batch_size: int,
-    ind_stream: _CorpusStream | None,
-    ood_stream: _CorpusStream | None,
+    ind_stream: _IndexedCorpusStream | None,
+    ood_stream: _IndexedCorpusStream | None,
 ) -> tuple[str, ...]:
     if language == "ind":
         if ind_stream is None:
@@ -2711,8 +2846,8 @@ def _restore_resume_state(
     learning_rates_by_group: dict[str, float],
     lr_scheduler: _LearningRateScheduler | None,
     router_lr_scheduler: _LearningRateScheduler | None,
-    ind_stream: _CorpusStream | None,
-    ood_stream: _CorpusStream | None,
+    ind_stream: _IndexedCorpusStream | None,
+    ood_stream: _IndexedCorpusStream | None,
     scheduler: _LanguageScheduler,
     route_bias_annealer: _RouteBiasAnnealer,
 ) -> None:
@@ -3029,8 +3164,8 @@ def _save_training_checkpoint(
     optimizer: Any,
     lr_scheduler: _LearningRateScheduler | None,
     router_lr_scheduler: _LearningRateScheduler | None,
-    ind_stream: _CorpusStream | None,
-    ood_stream: _CorpusStream | None,
+    ind_stream: _IndexedCorpusStream | None,
+    ood_stream: _IndexedCorpusStream | None,
     scheduler: _LanguageScheduler,
     route_bias_annealer: _RouteBiasAnnealer,
     step: int,
@@ -3067,8 +3202,8 @@ def _save_training_state(
     optimizer: Any,
     lr_scheduler: _LearningRateScheduler | None,
     router_lr_scheduler: _LearningRateScheduler | None,
-    ind_stream: _CorpusStream | None,
-    ood_stream: _CorpusStream | None,
+    ind_stream: _IndexedCorpusStream | None,
+    ood_stream: _IndexedCorpusStream | None,
     scheduler: _LanguageScheduler,
     route_bias_annealer: _RouteBiasAnnealer,
     step: int,
