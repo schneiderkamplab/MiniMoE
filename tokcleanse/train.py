@@ -887,13 +887,22 @@ def train_distilled_model(
         (distill_ind and ind_distill_weight > 0)
         or (distill_ood and ood_distill_weight > 0)
     )
+    chat_template = _load_chat_template_from_checkpoint(student_model)
     ind_stream = (
-        _IndexedCorpusStream(ind_files, rng=random.Random(rng.randrange(1 << 30)))
+        _IndexedCorpusStream(
+            ind_files,
+            rng=random.Random(rng.randrange(1 << 30)),
+            chat_template=chat_template,
+        )
         if ind_files
         else None
     )
     ood_stream = (
-        _IndexedCorpusStream(ood_files, rng=random.Random(rng.randrange(1 << 30)))
+        _IndexedCorpusStream(
+            ood_files,
+            rng=random.Random(rng.randrange(1 << 30)),
+            chat_template=chat_template,
+        )
         if ood_files
         else None
     )
@@ -1726,10 +1735,27 @@ _INDEX_FILENAME_SUFFIX = ".index"
 _WARN_LINE_COUNT = 1_000_000_000
 
 
+def _load_chat_template_from_checkpoint(model_path: str | Path) -> str | None:
+    """Load chat template from tokenizer_config.json if available."""
+    model_path = Path(model_path).expanduser()
+    config_path = model_path / "tokenizer_config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        return data.get("chat_template")
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
 @dataclass(slots=True)
 class _IndexedCorpusStream:
     paths: tuple[Path, ...]
     rng: random.Random
+    chat_template: str | None = None
     _index: list[tuple[int, int]] = field(init=False, repr=False)
     _shuffled_index: list[tuple[int, int]] = field(init=False, repr=False)
     _index_position: int = field(init=False, repr=False)
@@ -1903,8 +1929,53 @@ class _IndexedCorpusStream:
             return None
 
         path = self.paths[file_id].expanduser()
-        parsed = _parse_corpus_line(path, line)
+        parsed = self._parse_corpus_line_with_chat(path, line)
         return parsed
+
+    def _parse_corpus_line_with_chat(self, path: Path, raw_line: str) -> str | None:
+        stripped = raw_line.strip()
+        if not stripped:
+            return None
+        if path is not None and _is_jsonl_path(path):
+            try:
+                data = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSON in {path}") from exc
+            if not isinstance(data, dict):
+                raise ValueError(f"Expected JSON object in {path}")
+
+            if "messages" in data:
+                return self._apply_chat_template(data["messages"], path)
+            elif "text" in data:
+                if not isinstance(data["text"], str):
+                    raise ValueError(f"Expected string text in {path}")
+                return data["text"]
+            else:
+                raise ValueError(f"Expected JSON object with 'messages' or 'text' in {path}")
+        return stripped
+
+    def _apply_chat_template(self, messages: Any, path: Path) -> str:
+        if self.chat_template is None:
+            raise ValueError(
+                f"Chat data format detected in {path} but no chat_template provided. "
+                "Pass chat_template to _IndexedCorpusStream or format data as plain text."
+            )
+
+        if not isinstance(messages, list):
+            raise ValueError(f"Expected messages to be a list in {path}")
+
+        formatted = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                raise ValueError(f"Expected each message to be a dict in {path}")
+            role = msg.get("role")
+            content = msg.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                raise ValueError(f"Expected message with role and content strings in {path}")
+
+            formatted.append(f"{role}: {content}")
+
+        return self.chat_template.join(formatted) + self.chat_template
 
     def close(self) -> None:
         for handle in self._file_handles.values():
