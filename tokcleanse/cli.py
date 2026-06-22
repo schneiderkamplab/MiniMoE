@@ -908,6 +908,91 @@ def train_command(
     typer.echo(str(trained_path))
 
 
+@app.command("convert-to-chat")
+def convert_to_chat_command(
+    infile: Path = typer.Argument(..., help="Input JSONL file to convert."),
+    out_dir: Path = typer.Argument(
+        Path("data/processed"),
+        help="Output directory for converted files.",
+    ),
+    input_key: str = typer.Option(
+        DEFAULT_INPUT_KEY,
+        "--input-key",
+        help="Input key for flat JSONL datasets (e.g. transcript).",
+    ),
+    output_key: str = typer.Option(
+        DEFAULT_OUTPUT_KEY,
+        "--output-key",
+        help="Output key for flat JSONL datasets (e.g. summary).",
+    ),
+    system_key: str = typer.Option(
+        DEFAULT_SYSTEM_KEY,
+        "--system-key",
+        help="Optional system-prompt key for flat JSONL datasets.",
+    ),
+    gemma4_include_reasoning: bool = typer.Option(
+        DEFAULT_GEMMA4_INCLUDE_REASONING,
+        "--gemma4-include-reasoning/--no-gemma4-include-reasoning",
+        help="Include reasoning as a separate thought channel in Gemma 4 output.",
+    ),
+    with_reasoning: bool = typer.Option(
+        DEFAULT_WITH_REASONING,
+        "--with-reasoning/--no-reasoning",
+        help="Enable or disable reasoning generation calls.",
+    ),
+    model_name: str = typer.Option(
+        DEFAULT_MODEL_NAME,
+        "--model-name",
+        help="Model name used for reasoning generation.",
+    ),
+    batch_size: int = typer.Option(
+        DEFAULT_BATCH_SIZE,
+        min=1,
+        help="Async batch size for reasoning calls.",
+    ),
+    client_urls: str = typer.Option(
+        "https://api.openai.com/v1/",
+        help="Comma-separated list of OpenAI-compatible base URLs.",
+    ),
+    api_key: str = typer.Option(
+        default_factory=lambda: os.getenv("OPENAI_API_KEY", ""),
+        help="API key. Defaults to OPENAI_API_KEY environment variable.",
+    ),
+) -> None:
+    """Convert JSONL data to Gemma-4 chat format with optional reasoning."""
+    import asyncio
+
+    from .chat_converter import (
+        DEFAULT_BATCH_SIZE,
+        DEFAULT_GEMMA4_INCLUDE_REASONING,
+        DEFAULT_INPUT_KEY,
+        DEFAULT_MODEL_NAME,
+        DEFAULT_OUTPUT_KEY,
+        DEFAULT_SYSTEM_KEY,
+        DEFAULT_WITH_REASONING,
+        convert_to_chat,
+    )
+
+    try:
+        asyncio.run(
+            convert_to_chat(
+                infile=infile,
+                out_dir=out_dir,
+                input_key=input_key,
+                output_key=output_key,
+                system_key=system_key,
+                gemma4_include_reasoning=gemma4_include_reasoning,
+                with_reasoning=with_reasoning,
+                model_name=model_name,
+                batch_size=batch_size,
+                client_urls=client_urls,
+                api_key=api_key,
+            )
+        )
+    except (FileExistsError, ValueError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 def main() -> None:
     """Run the tokcleanse CLI."""
 
@@ -1151,10 +1236,12 @@ def _format_bool(value: bool) -> str:
 __all__ = [
     "app",
     "compare_command",
+    "convert_to_chat_command",
     "download_command",
     "logit_diff_command",
     "main",
     "sanitize_command",
+    "train_command",
     "upcycle_command",
 ]
 
