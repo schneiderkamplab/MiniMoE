@@ -1736,19 +1736,30 @@ _WARN_LINE_COUNT = 1_000_000_000
 
 
 def _load_chat_template_from_checkpoint(model_path: str | Path) -> str | None:
-    """Load chat template from tokenizer_config.json if available."""
+    """Load chat template from tokenizer_config.json or chat_template.jinja."""
     model_path = Path(model_path).expanduser()
-    config_path = model_path / "tokenizer_config.json"
-    if not config_path.exists():
-        return None
 
-    try:
-        data = json.loads(config_path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return None
-        return data.get("chat_template")
-    except (json.JSONDecodeError, OSError):
-        return None
+    # First check tokenizer_config.json for chat_template field
+    config_path = model_path / "tokenizer_config.json"
+    if config_path.exists():
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                chat_template = data.get("chat_template")
+                if chat_template:
+                    return chat_template
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # Fallback to chat_template.jinja file
+    jinja_path = model_path / "chat_template.jinja"
+    if jinja_path.exists():
+        try:
+            return jinja_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    return None
 
 
 def _resolve_chat_template(
