@@ -2006,18 +2006,14 @@ class _IndexedCorpusStream:
         if not isinstance(messages, list):
             raise ValueError(f"Expected messages to be a list in {path}")
 
-        formatted = []
-        for msg in messages:
-            if not isinstance(msg, dict):
-                raise ValueError(f"Expected each message to be a dict in {path}")
-            role = msg.get("role")
-            content = msg.get("content")
-            if not isinstance(role, str) or not isinstance(content, str):
-                raise ValueError(f"Expected message with role and content strings in {path}")
+        try:
+            from jinja2 import Template
 
-            formatted.append(f"{role}: {content}")
-
-        return self.chat_template.join(formatted) + self.chat_template
+            template = Template(self.chat_template)
+            rendered = template.render(messages=messages)
+            return rendered
+        except Exception as exc:
+            raise ValueError(f"Failed to render chat template: {exc}") from exc
 
     def close(self) -> None:
         for handle in self._file_handles.values():
