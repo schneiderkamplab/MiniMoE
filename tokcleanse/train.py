@@ -887,7 +887,7 @@ def train_distilled_model(
         (distill_ind and ind_distill_weight > 0)
         or (distill_ood and ood_distill_weight > 0)
     )
-    chat_template = _load_chat_template_from_checkpoint(student_model)
+    chat_template = _resolve_chat_template(student_model, teacher_model)
     ind_stream = (
         _IndexedCorpusStream(
             ind_files,
