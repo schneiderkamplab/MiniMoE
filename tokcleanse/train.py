@@ -1751,6 +1751,37 @@ def _load_chat_template_from_checkpoint(model_path: str | Path) -> str | None:
         return None
 
 
+def _resolve_chat_template(
+    student_model: str | Path,
+    teacher_model: str | Path,
+) -> str | None:
+    """Resolve chat template from student, fallback to teacher with confirmation."""
+    # Try student first
+    chat_template = _load_chat_template_from_checkpoint(student_model)
+    if chat_template:
+        typer.echo("Using chat template from student model", err=True)
+        return chat_template
+
+    # Fallback to teacher
+    chat_template = _load_chat_template_from_checkpoint(teacher_model)
+    if chat_template:
+        typer.echo(
+            f"Student model has no chat_template, found in teacher model: {teacher_model}",
+            err=True,
+        )
+        typer.echo("Use teacher's chat template? (Y/n): ", err=True, nl=False)
+        response = input().strip().lower()
+        if response == "y" or response == "":
+            typer.echo("Using chat template from teacher model", err=True)
+            return chat_template
+        else:
+            typer.echo("Skipping chat template (messages format won't work)", err=True)
+            return None
+
+    typer.echo("No chat_template found in student or teacher models", err=True)
+    return None
+
+
 @dataclass(slots=True)
 class _IndexedCorpusStream:
     paths: tuple[Path, ...]
