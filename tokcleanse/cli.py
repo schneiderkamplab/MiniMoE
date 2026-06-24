@@ -8,6 +8,15 @@ from typing import Any
 
 import typer
 
+from .chat_converter import (
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_GEMMA4_INCLUDE_REASONING,
+    DEFAULT_INPUT_KEY,
+    DEFAULT_MODEL_NAME,
+    DEFAULT_OUTPUT_KEY,
+    DEFAULT_SYSTEM_KEY,
+    DEFAULT_WITH_REASONING,
+)
 from .cleaner import DEFAULT_SAVE_ORDER_NAME, available_order_names, describe_order
 from .compare import (
     comparison_has_any_mismatch,
